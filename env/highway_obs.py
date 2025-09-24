@@ -193,6 +193,53 @@ def set_spectator_to_view_first_cone(
     )
     cam_rot = carla.Rotation(pitch=pitch_deg, yaw=yaw, roll=0.0)
     spec.set_transform(carla.Transform(cam_loc, cam_rot))
+
+def set_spectator_fixed(world: carla.World,
+    ego: carla.Actor,
+    back: float = 28.0,      # 相机沿车头反向后退的距离（米）
+    height: float = 7.0,     # 相机抬高（米）
+    side_offset: float = 0.0,# 右侧偏移（米），正数=向右，负数=向左
+    pitch_deg: float = -12.0,# 俯仰角（负值俯视）
+    look_at_roof: bool = True, # 自动微调俯仰角去看向车顶（更稳）
+):
+    """
+    把 spectator 固定在“自车后上方”，朝向自车前进方向。
+    - 不做任何后续更新；在初始化时调用一次即可。
+    - 右侧偏移 side_offset 可以让你看到一点点车身。
+    """
+    spec = world.get_spectator()
+    tf = ego.get_transform()
+
+    # 车头朝向（度→弧度）
+    yaw = tf.rotation.yaw
+    rad = math.radians(yaw)
+
+    # 前/右单位向量（CARLA 坐标系：x 前进，y 左→右为正；右向 = (sin,yaw, -cos,yaw)）
+    fx, fy = math.cos(rad), math.sin(rad)
+    rx, ry = math.sin(rad), -math.cos(rad)
+
+    # 计算相机位置：在自车后方 back 米、右侧 side_offset 米、上方 height 米
+    cam_loc = carla.Location(
+        x=tf.location.x - fx * back + rx * side_offset,
+        y=tf.location.y - fy * back + ry * side_offset,
+        z=tf.location.z + height,
+    )
+
+    # 计算朝向：默认沿自车前进方向；可选自动瞄准“车顶”
+    if look_at_roof:
+        # 目标看向自车车顶附近（略高 1.5m）
+        tgt = carla.Location(x=tf.location.x, y=tf.location.y, z=tf.location.z + 1.5)
+        vx, vy, vz = (tgt.x - cam_loc.x), (tgt.y - cam_loc.y), (tgt.z - cam_loc.z)
+        yaw_cam = math.degrees(math.atan2(vy, vx))          # 朝目标的平面方位角
+        dist_xy = max(1e-6, math.hypot(vx, vy))
+        pitch_cam = -math.degrees(math.atan2(vz, dist_xy))  # 向下为负
+    else:
+        yaw_cam = yaw
+        pitch_cam = pitch_deg
+
+    cam_rot = carla.Rotation(pitch=pitch_cam, yaw=yaw_cam, roll=0.0)
+    spec.set_transform(carla.Transform(cam_loc, cam_rot))
+
     
 def set_spectator_follow_actor(
     world: carla.World,
@@ -280,6 +327,9 @@ class HighwayEnv:
     # === 新增：提供第一个锥桶位姿给 agent 用来计算 EGO 的生成位置 ===
     def get_first_cone_transform(self) -> Optional[carla.Transform]:
         return self._first_cone_tf
+
+    def get_cone_actors(self) -> List[carla.Actor]:
+        return list(self._cones) if hasattr(self, "_cones") else []
 
     # === 新增：agent 生成 EGO 后，登记给环境，方便 get_observation/apply_control ===
     def set_ego(self, ego_actor: carla.Actor):

@@ -55,6 +55,25 @@ def draw_ego_marker(world: carla.World,
         world.debug.draw_string(loc, text, draw_shadow=False,
                                 color=carla.Color(*color), life_time=lifetime)
 
+def draw_obstacles_samples(world: carla.World, ref, world_points, color=(255, 0, 0), lifetime=0.2):
+    """
+    world_points: List[(x,y)] 世界坐标的障碍样本点（预测轨迹或静态）
+    """
+    for (x, y) in world_points:
+        wp = world.get_map().get_waypoint(carla.Location(x=x, y=y, z=0.0), project_to_road=True)
+        z = (wp.transform.location.z if wp else 0.0) + 0.05
+        world.debug.draw_point(carla.Location(x=x, y=y, z=z), size=0.08,
+                               color=carla.Color(*color), life_time=lifetime)
+        
+        
+def draw_pts_se(world, ref, pts_se, color=(255,0,0), size=0.08, life=0.6):
+    for (s, ey) in pts_se:
+        x, y = ref.se2xy(s, ey)
+        z = world.get_map().get_waypoint(carla.Location(x=x, y=y), project_to_road=True).transform.location.z + 0.05
+        world.debug.draw_point(carla.Location(x=x, y=y, z=z),
+                               size=size, color=carla.Color(*color), life_time=life)
+
+
 # ================== 离线记录 & 画图 ================== #
 class TelemetryLogger:
     """
@@ -139,3 +158,5 @@ class TelemetryLogger:
         plt.xlabel("frame"); plt.legend(); plt.grid(True)
         p3 = os.path.join(self.out_dir, "controls.png")
         plt.savefig(p3, dpi=150); plt.close(); print(f"[LOG] 图已保存: {p3}")
+
+

@@ -7,15 +7,19 @@ import sys
 sys.path.append("/home/ajifang/czw/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg")
 import carla
 import numpy as np
+import ipdb
 
+
+from typing import List, Tuple
 sys.path.append("/home/ajifang/czw/RL_selector")
 from env.highway_obs import HighwayEnv, get_ego_blueprint
 from env.highway_obs import right_unit_vector_from_yaw, forward_unit_vector_from_yaw
 from env.highway_obs import shift_location
 from planning.dp_corridor import DPCorridor
+from planning.obstacles import collect_obstacles_api
 from utils.control_mapping import ax_to_throttle_brake, delta_to_steer
-from agents.rule_based.vis_debug import draw_corridor, draw_ego_marker, TelemetryLogger
-from env.highway_obs import set_spectator_follow_actor
+from agents.rule_based.vis_debug import draw_corridor, draw_ego_marker, TelemetryLogger, draw_obstacles_samples, draw_pts_se
+from env.highway_obs import set_spectator_follow_actor, set_spectator_fixed
 
 # ========= 1) 在“同一车道中心 & 上游15–20m”生成 EGO =========
 def spawn_ego_upstream_lane_center(env: HighwayEnv) -> carla.Actor:
@@ -244,11 +248,62 @@ class RuleBasedPlanner:
         self.dp_interval = dp_interval
         self.frame = 0
         self.corridor = None  # type: Corridor|None
+        self._prev_delta = 0.0
+        self._prev_ax = 0.0
 
-    def update_corridor(self, world):
-        # 构建 cost-map → DP → corridor
-        cost = self.dp.build_cost_map(world, ref_xy2se=self.ref.xy2se, horizon_T=3.0, dt=0.2)
-        self.corridor = self.dp.run_dp(cost)
+
+    def update_corridor(self, world, ego=None, debug_draw_points: bool = True):
+        if ego is None:
+            self.corridor = None
+            return
+
+        # === 1) 计算本地窗口，并让 DP 的 s_grid 跟随自车滑动 ===
+        ego_tf = ego.get_transform()
+        s_center, _ = self.ref.xy2se(ego_tf.location.x, ego_tf.location.y)
+        s_lo = s_center - 10.0
+        s_hi = s_center + 20.0
+        # ★ 关键：把 DP 的 s_grid 移到 [s_lo, s_hi]，保证 DP 与采样窗口一致
+        self.dp.set_window(s0=s_lo, length_m=(s_hi - s_lo))
+
+        # === 2) 按同一窗口采样通用障碍的 Frenet 点 ===
+        pts_se = collect_obstacles_api(
+            world=world, ego=ego, ref_xy2se=self.ref.xy2se,
+            s_center=s_center, s_back=10.0, s_fwd=20.0,
+            r_xy=35.0, horizon_T=2.0, dt=0.2, static_density=0.3
+        )
+
+        # （可选）画障碍点：传入 (s,ey)，在函数里 se→xy 再画，避免坐标系混用
+        if debug_draw_points and pts_se:
+            draw_pts_se(world, self.ref, pts_se, color=(0, 255, 0), size=0.08, life=0.8)
+
+        # === 3) 构造动态障碍 cost_map（软代价，供 DP） ===
+        cost = self.dp.build_cost_map_general(
+            world=world, ego_actor=ego, ref_xy2se=self.ref.xy2se,
+            s_center=s_center, s_back=10.0, s_fwd=20.0,
+            sigma_s=2.5, sigma_y=0.6, horizon_T=2.0, dt=0.2
+        )
+        cost = np.asarray(cost, dtype=float)
+
+        # === 4) 先跑 DP（逐行阈值）得到初始 lo/up ===
+        corridor = self.dp.run_dp(cost_map=cost, row_percentile=60.0,
+                                  min_width=1.8, safety_margin=0.20)
+
+        # === 5) 用“硬边界墙”钳位 lo/up，让边界贴障碍几何 ===
+        if len(pts_se) > 0:
+            left_wall, right_wall = self.dp.walls_from_points(pts_se, corridor.s, self.dp.ds, safety=0.25)
+            lo = np.maximum(corridor.lower, right_wall)
+            up = np.minimum(corridor.upper, left_wall)
+            # 最小带宽兜底 + 轻平滑
+            bad = (up - lo) < 1.5
+            if np.any(bad):
+                mid = 0.5 * (up + lo)
+                lo[bad] = mid[bad] - 0.75
+                up[bad] = mid[bad] + 0.75
+            lo = 0.5 * lo + 0.5 * np.r_[lo[:1], lo[:-1]]
+            up = 0.5 * up + 0.5 * np.r_[up[:1], up[:-1]]
+            corridor.lower, corridor.upper = lo, up
+
+        self.corridor = corridor
 
     def _interp_bounds(self, s_now):
         s = self.corridor.s
@@ -256,72 +311,166 @@ class RuleBasedPlanner:
         up = np.interp(s_now, s, self.corridor.upper)
         return lo, up
 
-    def compute_control(self, obs: dict, dt: float=0.05) -> tuple[float,float,float,dict]:
+    def compute_control(self, obs: dict, dt: float = 0.05) -> tuple[float, float, float, dict]:
         """
-        输入: env.get_observation() 输出:
-          throttle, steer, brake, debug_info
-        规则控制核心：
-          - 计算当前 Frenet (s,ey)
-          - ey_ref = (lo+up)/2；误差 -> delta
-          - 走廊窄/误差大 → 降低 v_ref；纵向 ax 逼近 v_ref
+        规则控制（修正版）：
+          - 坐标对齐：s 夹在 corridor.s 范围内，保证 lo<=up
+          - 中线偏置：靠墙时让 ey_ref 向远离墙方向退一点
+          - 横向 = e_y + k_heading*e_psi（加航向项），随速衰减；转角限幅+限速
+          - 纵向 = 看“宽度”和“最近墙距”同时降速；ax 限幅+限速
         """
-        ego_pose = obs.get("ego_pose", {})
-        ego_v    = obs.get("ego_v", {})
-        x, y = ego_pose.get("x", 0.0), ego_pose.get("y", 0.0)
-        yaw_deg = ego_pose.get("yaw", 0.0)
-        speed = float(ego_v.get("speed", 0.0))
 
+        ego_pose = obs.get("ego_pose", {})
+        ego_v = obs.get("ego_v", {})
+        x, y = float(ego_pose.get("x", 0.0)), float(ego_pose.get("y", 0.0))
+        yaw_deg = float(ego_pose.get("yaw", 0.0))
+        speed = float(ego_v.get("speed", 0.0))
+        yaw_rad = np.deg2rad(yaw_deg)
+
+        # —— 1) 计算 Frenet 位姿 —— #
         s_now, ey_now = self.ref.xy2se(x, y)
 
-        lo, up = self._interp_bounds(s_now) if self.corridor is not None else (-1.5, 1.5)
-        width = max(0.2, up - lo)
-        ey_ref = 0.5*(lo + up)  # 走廊中线；可改成偏左/偏右策略
+        # —— 2) 插值走廊上下界（强制对齐 & 有效性保护） —— #
+        if self.corridor is None:
+            lo, up = -1.5, 1.5
+            s_q = s_now
+        else:
+            s_min, s_max = float(self.corridor.s[0]), float(self.corridor.s[-1])
+            s_q = float(np.clip(s_now, s_min, s_max))  # 夹在范围内
+            lo = float(np.interp(s_q, self.corridor.s, self.corridor.lower))
+            up = float(np.interp(s_q, self.corridor.s, self.corridor.upper))
+
+        # 保证 lo <= up
+        if lo > up:
+            lo, up = up, lo
+
+        width = max(1e-3, up - lo)
+
+        # —— 3) 中线 + "靠墙偏置" —— #
+        # 距左右墙的有向距离（正值=在边界内，负值=出界）
+        margin_r = ey_now - lo        # 距右边界有向距离
+        margin_l = up - ey_now        # 距左边界有向距离
+
+        # 靠墙时把目标中线朝"远离墙"偏一点；基于有向距离
+        bias_gain = 0.25              # 降低偏置强度（原0.35→0.25）
+        bias_zone = 0.40              # 距墙 < 0.4m 进入偏置区
+        bias = 0.0
+
+        # 只在车辆在边界内且靠近某一侧时才偏置
+        if margin_r < bias_zone and margin_r >= 0 and margin_r <= margin_l:
+            bias = +bias_gain * (bias_zone - margin_r)  # 靠近右边界，往左偏
+        elif margin_l < bias_zone and margin_l >= 0 and margin_l < margin_r:
+            bias = -bias_gain * (bias_zone - margin_l)  # 靠近左边界，往右偏
+
+        ey_ref = 0.5 * (lo + up) + bias
         e_y = ey_ref - ey_now
 
-        # 横向控制：比例 + 边界防撞（靠近边界时增益↑）
-        # 基础增益：
-        Ky = 0.8
-        # 边界权重（越靠边界越大）
-        margin = min(abs(ey_now - lo), abs(up - ey_now))
-        guard = 1.0 + 0.8*np.exp(-margin/0.3)
-        delta_cmd = (Ky*guard) * e_y   # [rad] 近似成前轮转角
+        # —— 4) 航向误差（基于参考线切线，稳定性改进） —— #
+        # 动态调整采样距离，提高数值稳定性
+        ds_yaw = max(2.0, speed * 0.3)  # 最小2米，高速时更远
+        x_fwd, y_fwd = self.ref.se2xy(s_q + ds_yaw, 0.0)
 
-        # 纵向参考：走廊越窄，速度越低
-        v_ref = max(6.0, min(self.v_ref_base, self.v_ref_base * (width/3.0)))
-        # 纵向加速度（简单 P 控制，限制变化率可按需加）
-        ax = 0.8*(v_ref - speed)
-        ax = np.clip(ax, -3.5, 2.0)
+        # 计算方向向量并检查有效性
+        dx, dy = x_fwd - x, y_fwd - y
+        if math.hypot(dx, dy) < 0.1:  # 距离太近时使用默认值
+            e_psi = 0.0
+        else:
+            yaw_ref = np.arctan2(dy, dx)  # 参考线方向
+            e_psi = np.arctan2(np.sin(yaw_ref - yaw_rad), np.cos(yaw_ref - yaw_rad))  # wrap 到 [-pi,pi]
 
-        throttle, brake = ax_to_throttle_brake(ax, speed, a_max=2.0, a_min=-3.5)
-        steer = delta_to_steer(delta_cmd, max_steer_rad=0.5)
+        # —— 5) 横向控制（e_y + k_psi*e_psi），随速衰减 + guard + 限幅/限速 —— #
+        # 更保守的控制增益，避免振荡
+        Ky0 = 0.6               # 横向位置增益（原0.9→0.6）
+        Kpsi0 = 1.0             # 航向增益（原1.5→1.0）
+
+        # 增强速度衰减，高速时更保守
+        Ky = Ky0 / (1.0 + 0.1 * max(0.0, speed))      # 增大衰减因子（原0.05→0.1）
+        Kpsi = Kpsi0 / (1.0 + 0.08 * max(0.0, speed)) # 增大衰减因子
+
+        # 边界guard：基于绝对距离，越靠边界增益越大
+        min_margin = min(abs(margin_l), abs(margin_r))
+        guard = 1.0 + 0.6 * np.exp(-min_margin / 0.25)  # 降低guard强度（原0.8→0.6）
+
+        delta_cmd = guard * (Ky * e_y + Kpsi * e_psi)  # [rad]
+
+        # 更保守的转角限制和变化率限制
+        delta_cmd = float(np.clip(delta_cmd, -0.30, 0.30))  # 限制到±17.2°（原±20°）
+
+        if not hasattr(self, "_prev_delta"):
+            self._prev_delta = 0.0
+
+        # 降低变化率限制，使转向更平滑
+        max_d_delta = np.deg2rad(45.0) * dt  # 变化率上限（原60°→45°/秒）
+        d_delta = float(np.clip(delta_cmd - self._prev_delta, -max_d_delta, +max_d_delta))
+        delta_cmd = self._prev_delta + d_delta
+        self._prev_delta = delta_cmd
+
+        # 改进的转向映射：更保守的最大角度假设
+        max_front_wheel_angle = 0.35  # 最大前轮角（原0.5→0.35弧度，约20°）
+        steer = float(np.clip(delta_cmd / max_front_wheel_angle, -1.0, 1.0))
+
+        # —— 6) 纵向控制：综合宽度 & 最近墙距降速 —— #
+        # 基础目标速度：随“走廊宽度”缩放
+        v_base = float(self.v_ref_base)
+        v_ref_w = np.clip(v_base * (width / 3.0), 6.0, v_base)
+        # 距墙很近再降一档（越近越保守）
+        shrink = 1.0
+        near = min(margin_l, margin_r)
+        if near < 0.6:
+            shrink = max(0.4, near / 0.6)  # 0~0.6m → 0.4~1.0
+        v_ref = v_ref_w * shrink
+
+        # 加速度（P 控制）+ 限幅 + 变化率限制
+        ax_cmd = 0.8 * (v_ref - speed)
+        ax_cmd = float(np.clip(ax_cmd, -3.0, 2.0))
+        if not hasattr(self, "_prev_ax"):
+            self._prev_ax = 0.0
+        max_d_ax = 3.0 * dt  # m/s^3，加速度变化率限制
+        d_ax = float(np.clip(ax_cmd - self._prev_ax, -max_d_ax, +max_d_ax))
+        ax = self._prev_ax + d_ax
+        self._prev_ax = ax
+
+        # 踏板映射
+        if ax >= 0.0:
+            throttle, brake = ax / 2.0, 0.0
+        else:
+            throttle, brake = 0.0, (-ax) / 3.0
+        throttle = float(np.clip(throttle, 0.0, 1.0))
+        brake = float(np.clip(brake, 0.0, 1.0))
 
         dbg = dict(
-            mode="DP-corridor + RuleMidline",
-            s=s_now, ey=ey_now, lo=lo, up=up, width=width,
-            ey_ref=ey_ref, e_y=e_y, guard=guard,
+            mode="DP-corridor + RuleMidline(+bias) + heading [FIXED]",
+            s=s_now, s_q=s_q, ey=ey_now, lo=lo, up=up, width=width,
+            ey_ref=ey_ref, e_y=e_y, e_psi=e_psi, guard=guard,
             v=speed, v_ref=v_ref, ax=ax, delta=delta_cmd,
             throttle=throttle, brake=brake, steer=steer,
+            margin_l=margin_l, margin_r=margin_r, bias=bias
         )
         return throttle, steer, brake, dbg
 
-    def close(self):
-        """清理本环境内登记的所有 actor，并退出同步模式。"""
+    def hard_world_cleanup(world: carla.World):
+        """
+        兜底：扫描并销毁标记为 hero 的自车 & 我们生成的锥桶（不影响其他交通参与者）。
+        只有在正常 env.close() 失败或你临时调试时使用。
+        """
         try:
-            for a in list(self._actors):
+            actors = world.get_actors()
+            # 销毁 hero（我们设置的 role_name='hero'）
+            for v in actors.filter("vehicle.*"):
                 try:
-                    a.destroy()
+                    if v.attributes.get("role_name", "") == "hero":
+                        v.destroy()
                 except Exception:
                     pass
-        finally:
-            self._actors.clear()
-            self.ego = None
-            if self._sync_cm is not None:
-                # 退出同步
+            # 销毁锥桶
+            for c in actors:
                 try:
-                    self._sync_cm.__exit__(None, None, None)
+                    if ("trafficcone" in c.type_id) or ("static.prop.cone" in c.type_id):
+                        c.destroy()
                 except Exception:
                     pass
-                self._sync_cm = None
+        except Exception:
+            pass
 
 
 # ========= 4) 主流程 =======
@@ -345,16 +494,24 @@ def main():
         ego = spawn_ego_upstream_lane_center(env)
 
         # 相机追尾视角，看清自车
-        set_spectator_follow_actor(
-            world=env.world,
-            actor=ego,
-            mode="chase",
-            distance=28.0,   # 再往后一些
-            height=7.0,
-            pitch_deg=-12.0,
-            yaw_offset=0.0,
-            side_offset=2.0
-        )
+        # set_spectator_follow_actor(
+        #     world=env.world,
+        #     actor=ego,
+        #     mode="chase",
+        #     distance=28.0,   # 再往后一些
+        #     height=7.0,
+        #     pitch_deg=-12.0,
+        #     yaw_offset=0.0,
+        #     side_offset=2.0
+        # )
+        set_spectator_fixed(world=env.world,
+                            ego=ego,
+                            back=5.0,       # 你也可用 24~32 之间微调
+                            height=7.0,      # 6~9 都可以
+                            side_offset=0, # 右偏一点，能看到车身
+                            pitch_deg=0.0,
+                            look_at_roof=True
+                        )
 
         # —— 3) 构建同车道参考线（LaneRef） —— #
         first_tf = env.get_first_cone_transform()
@@ -375,10 +532,13 @@ def main():
 
         dt = 0.05
         frame = 0
+
+        # debug - 移除调试断点
+        # ipdb.set_trace()
         while True:
             # 定期更新 DP 走廊，并在线画出来
             if (planner.corridor is None) or (frame % planner.dp_interval == 0):
-                planner.update_corridor(env.world)
+                planner.update_corridor(env.world, ego=env.ego)
                 draw_corridor(env.world, ref, planner.corridor)
 
             # 推进一步仿真 & 计算控制
@@ -390,7 +550,7 @@ def main():
                 ego_pose = obs.get("ego_pose", {})
                 draw_ego_marker(env.world, ego_pose.get("x", 0.0), ego_pose.get("y", 0.0))
 
-            # 控制信息打印（降采样）
+            # 控制信息打印（降采样）+ 转向调试信息
             if frame % 10 == 0:
                 print(
                     f"[CTRL] {dbg['mode']} | s={dbg['s']:.1f}, ey={dbg['ey']:.2f}, "
@@ -400,7 +560,12 @@ def main():
                     f"| delta={dbg['delta']:.3f} rad -> steer={dbg['steer']:.2f} "
                     f"| throttle={dbg['throttle']:.2f}, brake={dbg['brake']:.2f}"
                 )
-                # 相机跟随也顺便刷新一下
+                # 添加转向调试信息
+                print(
+                    f"[STEER] margin_l={dbg['margin_l']:.3f}, margin_r={dbg['margin_r']:.3f} "
+                    f"| e_psi={dbg.get('e_psi', 0.0):.3f}, bias={dbg.get('bias', 0.0):.3f}"
+                )
+                # # 相机跟随也顺便刷新一下
                 set_spectator_follow_actor(
                     world=env.world,
                     actor=env.ego,
@@ -423,11 +588,20 @@ def main():
     except KeyboardInterrupt:
         print("\n[Stop] 手动退出。")
     finally:
-        if logger is not None:
-            logger.save_csv()
-            logger.plot()
-
-        planner.close()
+        try:
+            if logger is not None:
+                logger.save_csv()
+                logger.plot()
+        except Exception:
+            pass
+        try:
+            env.close()  # ← 只关 env
+        except Exception:
+            pass
+        try:
+            planner.hard_world_cleanup(env.world)  # 兜底清理 hero & 锥桶
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
