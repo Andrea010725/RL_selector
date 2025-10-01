@@ -3,17 +3,8 @@ from __future__ import annotations
 from typing import List, Tuple
 import math
 
-# 更全的静态关键词（UE5/0.9.15 常见）
-STATIC_KEYS = (
-    "trafficcone", "traffic_cone",
-    "static.prop.trafficcone", "static.prop.trafficcone01", "static.prop.trafficcone02",
-    "static.prop.cone",
-    "static.prop.trafficwarning", "static.prop.warningconstruction",
-    "static.prop.streetbarrier", "static.prop.chainbarrier",
-)
-
-EXCLUDE_ROLE_NAMES = ("hero", "ego", "spectator")
-
+# 识别静态道具（UE5/0.9.15 常见命名）
+STATIC_HINTS = ("static.prop.", "trafficcone", "traffic_cone", "barrier", "warning")
 
 def _alive(a) -> bool:
     try:
@@ -22,153 +13,92 @@ def _alive(a) -> bool:
     except Exception:
         return False
 
-
 def _is_dynamic(a) -> bool:
     tid = getattr(a, "type_id", "").lower()
     return tid.startswith("vehicle.") or tid.startswith("walker.")
 
-
-def _is_static_candidate(a) -> bool:
+def _is_static(a) -> bool:
     tid = getattr(a, "type_id", "").lower()
-    if tid.startswith("static.prop."):
-        return True
-    return any(k in tid for k in STATIC_KEYS)
+    if tid.startswith("sensor."):  # 过滤传感器
+        return False
+    return any(k in tid for k in STATIC_HINTS)
 
-
-def _footprint_points(actor, density: float = 0.25):
-    """
-    沿包围盒四边插值采样；小物体同样走边，不再只取中心点。
-    density 为“步长（米）”，越小越密。
-    """
-    import math
+def _bb_bottom_vertices_world(actor):
+    """返回底面4角世界坐标；API不可用时返回[]。"""
     try:
-        bb = getattr(actor, "bounding_box", None)
+        bb = actor.bounding_box
         tf = actor.get_transform()
-        if not bb:
-            return [(tf.location.x, tf.location.y)]
-
-        ex, ey = float(bb.extent.x), float(bb.extent.y)
-        local = [(+ex, +ey, 0.0), (+ex, -ey, 0.0), (-ex, -ey, 0.0), (-ex, +ey, 0.0)]
-        yaw = math.radians(tf.rotation.yaw)
-        c, s = math.cos(yaw), math.sin(yaw)
-
-        world_corners = []
-        for (lx, ly, _lz) in local:
-            wx = tf.location.x + c * lx - s * ly
-            wy = tf.location.y + s * lx + c * ly
-            world_corners.append((wx, wy))
-
-        def _interp(pa, pb, step):
-            dx, dy = pb[0] - pa[0], pb[1] - pa[1]
-            L = math.hypot(dx, dy)
-            n = max(1, int(L / max(1e-3, step)))
-            for i in range(n + 1):
-                t = i / n
-                yield (pa[0] + t * dx, pa[1] + t * dy)
-
-        step = max(0.08, float(density))
-        densified = []
-        for i in range(4):
-            a = world_corners[i]
-            b = world_corners[(i + 1) % 4]
-            for p in _interp(a, b, step):
-                densified.append(p)
-        return densified
+        verts = bb.get_world_vertices(tf)
+        if not verts:
+            return []
+        # 取 z 最小的四个点作为“底面”
+        bottom = sorted(verts, key=lambda v: v.z)[:4]
+        return [(v.x, v.y) for v in bottom]
     except Exception:
         return []
-
 
 def collect_obstacles_api(
     world,
     ego,
-    ref_xy2se,          # xy -> (s, ey)
-    s_center: float,
-    s_back: float = 10.0,
-    s_fwd: float = 20.0,
-    r_xy: float = 35.0,
-    horizon_T: float = 2.0,
+    ref_xy2se,           # xy -> (s,ey)
+    s_center: float,     # 以 Frenet s 为中心（通常是自车 s）
+    s_back: float = 0.0, # 自车后向（极简版本默认不看后向）
+    s_fwd: float = 20.0, # 自车前向 20 m
+    r_xy: float = 60.0,  # 世界半径预筛
+    horizon_T: float = 0.0,  # 极简：不预测，填 0 即只取当前
     dt: float = 0.2,
-    static_density: float = 0.20,   # 更密一些，边界更连续
+    static_density: float = 0.0,  # 极简：不用插值，留参数不生效
 ) -> List[Tuple[float, float]]:
     """
-    输出 Frenet 点 (s, ey)：
-      - 动态(vehicle/walker)：常速外推
-      - 静态(static.prop.*、trafficcone*、barrier*)：包围盒边缘 footprint 采样
+    极简障碍采样：在自车前 0–s_fwd m（Frenet 窗口）内，收集：
+      - 动态(车辆/行人)：只取中心点（不预测）
+      - 静态(道具/锥桶)：取中心点 + 底面四角（若可得）
+    返回：[(s,ey), ...]
     """
     pts: List[Tuple[float, float]] = []
 
-    s_min = float(s_center - s_back)
-    s_max = float(s_center + s_fwd)
+    # Frenet s 窗口
+    s_min = float(s_center - max(0.0, s_back))
+    s_max = float(s_center + max(0.0, s_fwd))
 
     ego_tf = ego.get_transform()
-    ex, eyw = ego_tf.location.x, ego_tf.location.y
+    ex, ey = ego_tf.location.x, ego_tf.location.y
 
-    # === 动态 ===
-    try:
-        vehicles = world.get_actors().filter("vehicle.*")
-    except Exception:
-        vehicles = [a for a in world.get_actors() if _is_dynamic(a)]
-
-    try:
-        walkers = world.get_actors().filter("walker.*")
-    except Exception:
-        walkers = []
-
-    dyns = list(vehicles) + list(walkers)
-    steps = max(1, int(horizon_T / max(1e-6, dt)))
-
-    for a in dyns:
-        try:
-            if not _alive(a):
-                continue
-            if a.id == ego.id or a.attributes.get("role_name", "") in EXCLUDE_ROLE_NAMES:
-                continue
-
-            loc = a.get_transform().location
-            dx, dy = loc.x - ex, loc.y - eyw
-            if dx * dx + dy * dy > r_xy * r_xy:
-                continue
-
-            vel = a.get_velocity()
-            x0, y0, vx, vy = loc.x, loc.y, vel.x, vel.y
-            for k in range(steps + 1):
-                t = k * dt
-                x, y = x0 + vx * t, y0 + vy * t
-                s, eyf = ref_xy2se(x, y)
-                if s_min <= s <= s_max:
-                    pts.append((float(s), float(eyf)))
-        except Exception:
+    actors = world.get_actors()
+    for a in actors:
+        if not _alive(a) or a.id == ego.id:
             continue
 
-    # === 静态（含锥桶/路障） ===
-    try:
-        statics = world.get_actors().filter("static.prop.*")
-    except Exception:
-        statics = [a for a in world.get_actors() if _is_static_candidate(a)]
+        # 世界坐标欧氏预筛
+        tf = a.get_transform()
+        ax, ay = tf.location.x, tf.location.y
+        dx, dy = ax - ex, ay - ey
+        if (dx*dx + dy*dy) > (r_xy * r_xy):
+            continue
 
-    for a in statics:
+        # 投 Frenet 看是否落在 s 窗口
         try:
-            if not _alive(a):
-                continue
-            if a.id == ego.id or a.attributes.get("role_name", "") in EXCLUDE_ROLE_NAMES:
-                continue
-
-            tid = getattr(a, "type_id", "").lower()
-            if (not tid.startswith("static.prop.")) and (not any(k in tid for k in STATIC_KEYS)):
-                continue
-
-            loc = a.get_transform().location
-            dx, dy = loc.x - ex, loc.y - eyw
-            if dx * dx + dy * dy > r_xy * r_xy:
-                continue
-
-            # 一律走 footprint（小物体也走边，比中心点稳得多）
-            for (x, y) in _footprint_points(a, density=static_density):
-                s, eyf = ref_xy2se(x, y)
-                if s_min <= s <= s_max:
-                    pts.append((float(s), float(eyf)))
+            s0, e0 = ref_xy2se(ax, ay)
         except Exception:
+            continue
+        if not (s_min <= s0 <= s_max):
+            continue
+
+        if _is_dynamic(a):
+            # 动态：只用中心点（最稳）
+            pts.append((float(s0), float(e0)))
+        elif _is_static(a):
+            # 静态：中心点 + 底面四角
+            pts.append((float(s0), float(e0)))
+            for (vx, vy) in _bb_bottom_vertices_world(a):
+                try:
+                    s1, e1 = ref_xy2se(vx, vy)
+                    if s_min <= s1 <= s_max:
+                        pts.append((float(s1), float(e1)))
+                except Exception:
+                    continue
+        else:
+            # 其他：忽略
             continue
 
     return pts
-
