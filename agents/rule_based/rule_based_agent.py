@@ -548,8 +548,10 @@ def main():
         )
 
         ego , ego_wp= spawn_ego_upstream_lane_center(env)
-        idp = 0.8  #  这里切换周围交通参与者的密度
+        idp = 0.3 #  这里切换周围交通参与者的密度
         scenemanager = SceneManager(ego_wp, idp)
+        import ipdb
+        # ipdb.set_trace()
         scenemanager.gen_traffic_flow(env.world, ego_wp)
 
         # 参考线：用第一个锥桶所在驾驶车道作为种子

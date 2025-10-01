@@ -489,7 +489,9 @@ class HighwayEnv:
 
     def close(self):
         try:
-            for a in self._actors:
+            actor_list = self.world.get_actors()
+
+            for a in actor_list:
                 with contextlib.suppress(Exception):
                     a.destroy()
         finally:

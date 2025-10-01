@@ -26,7 +26,7 @@ VEHICLE_TYPE_DICT = {
     'vehicle.jeep.wrangler_rubicon': ['car', 'suv', 'wheel4', 'common', 'czw1'],
     'vehicle.lincoln.mkz_2020': ['car', 'wheel4', 'common', 'czw1'],
     'vehicle.mercedes.coupe': ['car', 'wheel4', 'common', 'czw1'],
-    'vehicle.mini.cooperst': ['car', 'wheel4', 'common'],
+    'vehicle.mini.cooper_s': ['car', 'wheel4', 'common'],
     'vehicle.nissan.micra': ['car', 'wheel4', 'common', 'czw1'],
     'vehicle.nissan.patrol': ['car', 'suv', 'wheel4', 'common', 'czw1'],
     'vehicle.seat.leon': ['car', 'wheel4', 'common', 'czw1'],
@@ -234,99 +234,127 @@ class SceneManager():
                 else:
                     raise
 
-    def right_traffic_flow_scenario(self, world, scene_cfg={}, gen_cfg={}):
-        # Desc: 在当前车道的右侧车道生成交通流，如果右侧为行驶车道
-        processed_lanes = []
-        if scene_cfg.get('self_lane', False):
-            bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-            self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-        processed_lanes.append(self.wp.lane_id)
+    def right_traffic_flow_scenario(self, world, scene_cfg=None, gen_cfg=None):
+            """
+            修正版：在 self.wp 的右侧可行驶车道上生成交通流。
+            使用 try...finally 确保 self.wp 在函数结束时被恢复。
+            """
+            if scene_cfg is None: scene_cfg = {}
+            if gen_cfg is None: gen_cfg = {}
 
-        driving_lane_count = 0
-        while self.wp is not None:
-            wp = self.wp.get_right_lane()
-            if wp is None:
-                return
-            if reduce(lambda x, y: x * y, [wp.lane_id, processed_lanes[0]]) < 0:
-                break
-            if wp.lane_type != carla.LaneType.Driving or wp.lane_id in processed_lanes or driving_lane_count >= scene_cfg.get(
-                    'lane_num', 999):
-                return
-            bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-            self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-            processed_lanes.append(wp.lane_id)
-            driving_lane_count += 1
+            original_wp = self.wp  # 保存原始状态
+            try:
+                processed_lanes = {self.wp.lane_id}
+                driving_lane_count = 0
 
-    def left_traffic_flow_scenario(self, world, scene_cfg={}, gen_cfg={}):
-        # Desc: 在当前车道的左侧车道生成交通流，如果左侧为行驶车道
-        processed_lanes = []
-        if scene_cfg.get('self_lane', False):
-            bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-            self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-        processed_lanes.append(self.wp.lane_id)
+                while True:
+                    next_wp = self.wp.get_right_lane()
+                    if next_wp is None or next_wp.lane_id * self.wp.lane_id < 0:
+                        break
 
-        driving_lane_count = 0
-        while self.wp is not None:
-            wp = self.wp.get_left_lane()
-            if wp is None:
-                return
-            if reduce(lambda x, y: x * y, [wp.lane_id, processed_lanes[0]]) < 0:
-                break
-            if wp.lane_type != carla.LaneType.Driving or wp.lane_id in processed_lanes or driving_lane_count >= scene_cfg.get(
-                    'lane_num', 999):
-                break
-            bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-            self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-            processed_lanes.append(wp.lane_id)
-            driving_lane_count += 1
+                    self.wp = next_wp  # 临时修改 self.wp 用于迭代
 
-    def opposite_traffic_flow_scenario(self, world,  scene_cfg={}, gen_cfg={}):
-        # Desc: 在当前道路的对向车道生成交通流
+                    if self.wp.lane_type != carla.LaneType.Driving or self.wp.lane_id in processed_lanes:
+                        continue
+                    if driving_lane_count >= scene_cfg.get('lane_num', 999):
+                        break
 
-        # Special: 获取当前车道的对向车道的最左侧的waypoint
-        added_lanes = []
-        last_wp = None
-        while True:
-            if self.wp is None:
-                return
-            if self.wp.lane_id in added_lanes:
-                break
-            added_lanes.append(self.wp.lane_id)
-            last_wp = self.wp
-            wp = self.wp.get_left_lane()
+                    bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
+                    self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
+                    processed_lanes.add(self.wp.lane_id)
+                    driving_lane_count += 1
+            finally:
+                self.wp = original_wp  # 无论如何，恢复原始状态
 
-        if last_wp is None:
-            return
+    def left_traffic_flow_scenario(self, world, scene_cfg=None, gen_cfg=None):
+            """
+            修正版：在 self.wp 的左侧可行驶车道上生成交通流。
+            """
+            if scene_cfg is None: scene_cfg = {}
+            if gen_cfg is None: gen_cfg = {}
 
-        while last_wp.lane_type != carla.LaneType.Driving:
-            if last_wp is None:
-                return
-            last_wp = last_wp.get_right_lane()
+            original_wp = self.wp  # 保存原始状态
+            try:
+                processed_lanes = {self.wp.lane_id}
+                driving_lane_count = 0
 
-        scene_cfg.update({'self_lane': True})
-        self.right_traffic_flow_scenario(world, scene_cfg, gen_cfg)
+                while True:
+                    next_wp = self.wp.get_left_lane()
+                    if next_wp is None or next_wp.lane_id * self.wp.lane_id < 0:
+                        break
 
-    def right_parking_vehicle_scenario(self, world, wp, scene_cfg={}, gen_cfg={}):
-        # Desc: 在当前车道的右侧车道生成停车车辆
-        processed_lanes = set()
-        if scene_cfg.get('self_lane', False):
-            if wp.lane_type == carla.LaneType.Stop or (wp.lane_type == carla.LaneType.Shoulder and wp.lane_width >= 2):
-                bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-                self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-        processed_lanes.add(wp.lane_id)
+                    self.wp = next_wp  # 临时修改 self.wp
 
-        stop_lane_count = 0
-        while True:
-            wp = wp.get_right_lane()
-            if wp is None:
-                return
-            if wp.lane_type != carla.LaneType.Stop and (wp.lane_type != carla.LaneType.Shoulder or wp.lane_width < 2):
-                continue
-            if wp.lane_id in processed_lanes or stop_lane_count >= scene_cfg.get('lane_num', 999):
-                return
-            bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
-            self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
-            processed_lanes.add(wp.lane_id)
+                    if self.wp.lane_type != carla.LaneType.Driving or self.wp.lane_id in processed_lanes:
+                        continue
+                    if driving_lane_count >= scene_cfg.get('lane_num', 999):
+                        break
+
+                    bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
+                    self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
+                    processed_lanes.add(self.wp.lane_id)
+                    driving_lane_count += 1
+            finally:
+                self.wp = original_wp  # 恢复原始状态
+
+
+
+    def right_parking_vehicle_scenario(self, world, wp, scene_cfg=None, gen_cfg=None):
+            if scene_cfg is None: scene_cfg = {}
+            if gen_cfg is None: gen_cfg = {}
+
+            processed_lanes = set()
+            stop_lane_count = 0
+            current_wp = wp
+
+            while True:
+                is_parkable = current_wp.lane_type == carla.LaneType.Parking or current_wp.lane_type == carla.LaneType.Shoulder
+                if is_parkable and current_wp.lane_id not in processed_lanes:
+                    # 注意：这里我们假设 _traffic_flow_scenario 也能处理停车
+                    # 如果有专门的停车生成函数会更好
+                    # 为了兼容，我们临时修改并恢复 self.wp
+                    original_wp = self.wp
+                    self.wp = current_wp
+                    bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
+                    self.wp = original_wp
+
+                    self._apply_bp_generation(world, bp_and_transforms, **gen_cfg)
+                    processed_lanes.add(current_wp.lane_id)
+                    stop_lane_count += 1
+                    if stop_lane_count >= scene_cfg.get('lane_num', 999):
+                        break
+
+                next_wp = current_wp.get_right_lane()
+                if next_wp is None: break
+                current_wp = next_wp
+
+    def gen_traffic_flow(self, world, ego_wp):
+            """
+            总调用函数 - 保持原始调用接口不变
+            """
+            # 在执行任何操作前，确保类的状态 self.wp 是正确的
+            self.wp = ego_wp
+
+            # For: 右侧交通流
+            self.right_traffic_flow_scenario(world,
+                                             scene_cfg={'filters': '+czw1', 'idp': self.idp, 'lane_num': 2},
+                                             gen_cfg={'name_prefix': 'right'})
+            # For: 左侧交通流
+            self.left_traffic_flow_scenario(world,
+                                            scene_cfg={'filters': '+czw1', 'idp': self.idp, 'lane_num': 2},
+                                            gen_cfg={'name_prefix': 'left'})
+            # For: 对向交通流
+            # self.opposite_traffic_flow_scenario(world,
+            #                                     scene_cfg={'filters': '+czw1', 'idp': self.idp, 'lane_num': 2,
+            #                                                'backward_num': 2},
+            #                                     gen_cfg={'name_prefix': 'opposite'})
+            # For: 路边停靠车辆 (此函数按原样传递ego_wp)
+            self.right_parking_vehicle_scenario(world, ego_wp,
+                                                scene_cfg={'filters': '+wheel4-large', 'idp': self.idp,
+                                                           'forward_num': 2, 'lane_num': 1},
+                                                gen_cfg={'name_prefix': 'park'})
+
+
 
     def gen_traffic_flow_low_density(self, world, ego_wp):
         """低密度交通流生成"""
@@ -356,13 +384,13 @@ class SceneManager():
                                         gen_cfg={'name_prefix': 'left'})
 
         # 对向交通流 - 减少车辆数
-        self.opposite_traffic_flow_scenario(world,
-                                            scene_cfg={
-                                                'filters': '+czw1',
-                                                'idp': random_perc,
-                                                'backward_num': 1  # 只生成1辆对向车
-                                            },
-                                            gen_cfg={'name_prefix': 'opposite'})
+        # self.opposite_traffic_flow_scenario(world,
+        #                                     scene_cfg={
+        #                                         'filters': '+czw1',
+        #                                         'idp': random_perc,
+        #                                         'backward_num': 1  # 只生成1辆对向车
+        #                                     },
+        #                                     gen_cfg={'name_prefix': 'opposite'})
 
         # 停车车辆 - 很少
         self.right_parking_vehicle_scenario(world, ego_wp,
@@ -400,14 +428,14 @@ class SceneManager():
                                         },
                                         gen_cfg={'name_prefix': 'left'})
 
-        # 对向交通流
-        self.opposite_traffic_flow_scenario(world,
-                                            scene_cfg={
-                                                'filters': '+czw1',
-                                                'idp': random_perc,
-                                                'backward_num': 3  # 3辆对向车
-                                            },
-                                            gen_cfg={'name_prefix': 'opposite'})
+        # # 对向交通流
+        # self.opposite_traffic_flow_scenario(world,
+        #                                     scene_cfg={
+        #                                         'filters': '+czw1',
+        #                                         'idp': random_perc,
+        #                                         'backward_num': 3  # 3辆对向车
+        #                                     },
+        #                                     gen_cfg={'name_prefix': 'opposite'})
 
         # 停车车辆
         self.right_parking_vehicle_scenario(world, ego_wp,
@@ -446,13 +474,13 @@ class SceneManager():
                                         gen_cfg={'name_prefix': 'left'})
 
         # 对向交通流
-        self.opposite_traffic_flow_scenario(world,
-                                            scene_cfg={
-                                                'filters': '+czw1',
-                                                'idp': random_perc,
-                                                'backward_num': 5  # 5辆对向车
-                                            },
-                                            gen_cfg={'name_prefix': 'opposite'})
+        # self.opposite_traffic_flow_scenario(world,
+                                            # scene_cfg={
+                                            #     'filters': '+czw1',
+                                            #     'idp': random_perc,
+                                            #     'backward_num': 5  # 5辆对向车
+                                            # },
+                                            # gen_cfg={'name_prefix': 'opposite'})
 
         # 停车车辆 - 更多
         self.right_parking_vehicle_scenario(world, ego_wp,
@@ -484,34 +512,7 @@ class SceneManager():
             print(f"未知密度级别 '{density_level}'，使用默认中密度")
             self.gen_traffic_flow_medium_density(world, ego_wp)
 
-    def gen_traffic_flow(self, world, ego_wp):  # input :自车的wp
-        """原始交通流生成函数 - 保持向后兼容"""
-        # For: 右侧交通流
-        # random_perc = random.randint(1, 10) / 10
-        # random_perc = 0.0
-        self.right_traffic_flow_scenario(world,
-                                         scene_cfg={'filters': '+czw1', 'idp': self.idp, 'lanes_num': 2},
-                                         gen_cfg={'name_prefix': 'right'})
-        # For: 左侧交通流
-        self.left_traffic_flow_scenario(world,
-                                        scene_cfg={'filters': '+czw1', 'idp': self.idp, 'lanes_num': 2},
-                                        gen_cfg={'name_prefix': 'left'})
-        # For: 对向交通流
-        self.opposite_traffic_flow_scenario(world, 
-                                            scene_cfg={'filters': '+czw1', 'idp': self.idp, 'backward_num': 2},
-                                            gen_cfg={'name_prefix': 'opposite'})
-        # # For: 路边停靠车辆
-        self.right_parking_vehicle_scenario(world, ego_wp,
-                                            scene_cfg={'filters': '+wheel4-large', 'idp': self.idp,
-                                                       'forward_num': 2},
-                                            gen_cfg={'name_prefix': 'park'})
 
-        # if actor.type_id.startswith('vehicle'):
-        #     actor.set_autopilot(enabled=True, tm_port=CarlaDataProvider.get_traffic_manager_port())
-        #     if a_index == 0:
-        #         self.traffic_manager.set_desired_speed(actor, 0)
-        #     else:
-        #         self.traffic_manager.set_desired_speed(actor, random.randint(10, 15))
 
     def ahead_obstacle_scenario(self, world, wp, scene_cfg={}, gen_cfg={}):  # construction 1 or construction 2
         # 检查gen_cfg字典中是否有name_prefix键，根据其值决定调用哪个函数
