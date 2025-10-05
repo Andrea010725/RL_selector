@@ -4,6 +4,8 @@ import math
 import random
 import sys
 from types import SimpleNamespace
+from scipy.optimize import minimize
+
 from typing import List, Tuple
 
 sys.path.append("/home/ajifang/czw/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg")
@@ -291,7 +293,6 @@ class RuleBasedPlanner:
         self._prev_delta = 0.0
         self._prev_ax = 0.0
 
-
     def update_corridor_simplified(self, world, ego, s_ahead=30.0, ds=1.0, ey_range=8.0, dey=0.15, horizon_T=2.0,
                                    dt=0.2, debug_draw=True):
         """
@@ -465,117 +466,34 @@ class RuleBasedPlanner:
         num_valid_s = len(optimal_path_ey)
 
         # ================= 5. [最终修正] 提取、决策、并按明确规则重构走廊 =================
-        initial_upper_ey, initial_lower_ey = np.zeros(num_valid_s), np.zeros(num_valid_s)
-        HIGH_COST_THRESHOLD = W_LANE
+        final_upper_ey = np.zeros(num_valid_s)
+        final_lower_ey = np.zeros(num_valid_s)
+
+        # 设置一个合理的阈值，它必须低于 W_LANE 和 W_OPPOSITE_LANE
+        # 这样扫描时才能在这些惩罚区前停下。'inf'成本的障碍物自然也会让它停下。
+        HIGH_COST_THRESHOLD = 10000.0
+
         for i in range(num_valid_s):
-            center_idx = np.argmin(np.abs(ey_nodes - optimal_path_ey[i]))
+            # optimal_path_ey[i] 是DP算法给出的在s_nodes[i]处的最佳ey位置
+            center_ey = optimal_path_ey[i]
+            center_idx = np.argmin(np.abs(ey_nodes - center_ey))
             cost_slice = cost_map[i, :]
-            left_idx, right_idx = center_idx, center_idx
-            while left_idx + 1 < num_ey and cost_slice[left_idx + 1] < HIGH_COST_THRESHOLD: left_idx += 1
-            initial_upper_ey[i] = ey_nodes[left_idx]
-            while right_idx - 1 >= 0 and cost_slice[right_idx - 1] < HIGH_COST_THRESHOLD: right_idx -= 1
-            initial_lower_ey[i] = ey_nodes[right_idx]
 
-        corridor_upper_ey = initial_upper_ey.copy()
-        corridor_lower_ey = initial_lower_ey.copy()
+            # 从最优路径点向左扫描边界
+            upper_idx = center_idx
+            while upper_idx + 1 < num_ey and cost_slice[upper_idx + 1] < HIGH_COST_THRESHOLD:
+                upper_idx += 1
+            final_upper_ey[i] = ey_nodes[upper_idx]
 
-        #
-        # corridor_width = initial_upper_ey - initial_lower_ey
-        # blocked_indices = np.where(corridor_width < PASSABLE_WIDTH_THRESHOLD)[0]
-        # is_blocked = len(blocked_indices) > 0
-        #
-        # if is_blocked:
-        #     blockage_start_idx = blocked_indices[0] if len(blocked_indices) > 0 else 0
-        #     print(f"[决策] 在索引 {blockage_start_idx} 处发现阻塞。检查相邻车道...")
-        #     amap = world.get_map()
-        #     s_of_blockage = s_nodes[blockage_start_idx]
-        #     x_b, y_b = self.ref.se2xy(s_of_blockage, 0.0)
-        #     decision_wp = amap.get_waypoint(carla.Location(x=x_b, y=y_b), project_to_road=True,
-        #                                     lane_type=carla.LaneType.Driving)
-        #
-        #     can_go_left, can_go_right = False, False
-        #
-        #     # 首先获取当前车道的 lane_id
-        #     current_lane_id = decision_wp.lane_id
-        #
-        #     # --- 检查左侧车道 ---
-        #     import ipdb
-        #     left_lane = decision_wp.get_left_lane()
-        #     # 确保左侧车道存在，并且是可行驶的
-        #     if left_lane and left_lane.lane_type == carla.LaneType.Driving:
-        #         # 新的判断逻辑：通过 lane_id 的符号判断方向是否一致
-        #         # 同向行驶的车道 lane_id 符号相同，因此它们的乘积必然大于0
-        #         if current_lane_id * left_lane.lane_id > 0:
-        #             # 检查路网信息是否允许向左变
-        #              can_go_left = True
-        #
-        #     # --- 检查右侧车道 ---
-        #     right_lane = decision_wp.get_right_lane()
-        #     # 确保右侧车道存在，并且是可行驶的
-        #     if right_lane and right_lane.lane_type == carla.LaneType.Driving:
-        #         # 使用同样的逻辑判断右侧车道
-        #         if current_lane_id * right_lane.lane_id > 0:
-        #             # 检查路网信息是否允许向右变道
-        #             can_go_right = True
-        #
-        #     print(f"[决策] 判断结果: can_go_left={can_go_left}, can_go_right={can_go_right}")
-        #     if can_go_right:
-        #         print("[决策] 右侧车道可用，按最终规则重构走廊！")
-        #         for i in range(blockage_start_idx, num_valid_s):
-        #             s_idx_ref = np.argmin(np.abs(self.ref.s - s_nodes[i]))
-        #             waypoint = self.ref.wps[s_idx_ref]
-        #
-        #             cost_slice = cost_map[i, :]
-        #             obstacle_indices = np.where(np.isinf(cost_slice))[0]
-        #             obstacle_ey_values = ey_nodes[obstacle_indices]
-        #             # ########## 核心修正点 1 ##########
-        #             # 寻找位于车道中心线（ey=0）右侧的障碍物
-        #             right_lane_obstacles = obstacle_ey_values[obstacle_ey_values > 0]
-        #             if len(right_lane_obstacles) > 0:
-        #                 corridor_lower_ey[i] = np.max(right_lane_obstacles)
-        #             else:
-        #                 corridor_lower_ey[i] = initial_lower_ey[i]
-        #
-        #             right_lane_wp = waypoint.get_right_lane()
-        #             if right_lane_wp:
-        #             #     corridor_upper_ey[i] = (waypoint.lane_width * 0.5 + right_lane_wp.lane_width)
-        #             # else:
-        #                 corridor_upper_ey[i] = initial_upper_ey[i]  # Fallback
-        #
-        #             for i in range(1, num_valid_s):
-        #                 corridor_lower_ey[i] = max(corridor_lower_ey[i - 1], corridor_lower_ey[i])
-        #
-        #     elif can_go_left:
-        #         print("[决策] 左侧车道可用，按最终规则重构走廊！")
-        #         for i in range(blockage_start_idx, num_valid_s):
-        #             cost_slice = cost_map[i, :]
-        #             obstacle_indices = np.where(np.isinf(cost_slice))[0]
-        #             obstacle_ey_values = ey_nodes[obstacle_indices]
-        #             # ########## 核心修正点 2 ##########
-        #             s_idx_ref = np.argmin(np.abs(self.ref.s - s_nodes[i]))
-        #             waypoint = self.ref.wps[s_idx_ref]
-        #             import ipdb
-        #             # ipdb.set_trace()
-        #             left_lane_wp = waypoint.get_left_lane()
-        #             if left_lane_wp:
-        #             #     corridor_lower_ey[i] = -(waypoint.lane_width * 0.5 + left_lane_wp.lane_width)
-        #             # else:
-        #                 corridor_lower_ey[i] = initial_lower_ey[i]  # Fallback
-        #
-        #             # 寻找位于车道中心线（ey=0）左侧的障碍物
-        #             left_lane_obstacles = obstacle_ey_values[obstacle_ey_values < 0]
-        #             if len(left_lane_obstacles) > 0:
-        #                 corridor_upper_ey[i] = np.max(left_lane_obstacles)
-        #             else:
-        #                 corridor_upper_ey[i] = initial_upper_ey[i]
-        #
-        #             for i in range(1, num_valid_s):
-        #                     corridor_upper_ey[i] = min(corridor_upper_ey[i - 1], corridor_upper_ey[i])
+            # 从最优路径点向右扫描边界
+            lower_idx = center_idx
+            while lower_idx - 1 >= 0 and cost_slice[lower_idx - 1] < HIGH_COST_THRESHOLD:
+                lower_idx -= 1
+            final_lower_ey[i] = ey_nodes[lower_idx]
 
-        # if not is_blocked:
-        # for i in range(1, num_valid_s):
-        #         corridor_upper_ey[i] = min(corridor_upper_ey[i - 1], corridor_upper_ey[i])
-        #         corridor_lower_ey[i] = max(corridor_lower_ey[i - 1], corridor_lower_ey[i])
+        # 直接将扫描结果作为最终走廊
+        corridor_upper_ey = final_upper_ey
+        corridor_lower_ey = final_lower_ey
 
         # ================= 6. 可视化与输出 =================
         corridor_s = s_nodes[:num_valid_s]
@@ -605,9 +523,45 @@ class RuleBasedPlanner:
                 p_lower_1 = carla.Location(lower_pts[i].x, lower_pts[i].y, z_offset)
                 p_lower_2 = carla.Location(lower_pts[i + 1].x, lower_pts[i + 1].y, z_offset)
                 dbg.draw_line(p_upper_1, p_upper_2, thickness=0.1, color=color_upper, life_time=life_time,
-                              persistent_lines=False)
+                               persistent_lines=False)
                 dbg.draw_line(p_lower_1, p_lower_2, thickness=0.1, color=color_lower, life_time=life_time,
-                              persistent_lines=False)
+                               persistent_lines=False)
+
+    # 搭建车辆模型
+    def vehicle_model_frenet(self, x, u, L=2.5):
+        """
+        Frenet坐标系下的车辆动力学模型.
+
+        :param x: 状态向量 [vx, ey, yaw_err, s]
+                        vx: 纵向速度 (m/s)
+                        ey: 横向偏移 (m)
+                        yaw_err: 航向角误差 (rad)
+                        s: 沿参考线的纵向距离 (m)
+        :param u: 控制向量 [accel, delta]
+                        accel: 加速度 (m/s^2)
+                        delta: 前轮转角 (rad)
+        :param L: 车辆轴距 (m)
+        :return: 状态量的变化率 [vx_dot, ey_dot, yaw_err_dot, s_dot]
+        """
+        vx, ey, yaw_err, s = x
+        accel, delta = u
+
+        # 假设横向速度 vy 近似为 0，侧偏角 beta 通过 yaw_err 和 ey_dot 近似
+
+        # 横向偏移的变化率
+        ey_dot = vx * math.sin(yaw_err)
+
+        # 航向角误差的变化率 (车辆的横摆角速度)
+        # 经典自行车模型： omega = v * tan(delta) / L
+        yaw_err_dot = vx * math.tan(delta) / L
+
+        # 纵向速度的变化率
+        vx_dot = accel
+
+        # 纵向距离 s 的变化率
+        s_dot = vx * math.cos(yaw_err)
+
+        return np.array([vx_dot, ey_dot, yaw_err_dot, s_dot])
 
     def compute_control(self, ego: carla.Actor, dt: float = 0.05):
         """
@@ -618,98 +572,130 @@ class RuleBasedPlanner:
         vel = ego.get_velocity()
         speed = float(math.hypot(vel.x, vel.y))
         x, y = tf.location.x, tf.location.y
-        yaw_rad = math.radians(tf.rotation.yaw)
 
+        # --- 1. 检查走廊是否存在 ---
+        if self.corridor is None or len(self.corridor.s) < 3:
+            return 0.0, 0.0, 1.0, {}  # 紧急刹车
+
+        # --- 2. 定义MPC参数 ---
+        H = 10  # 预测时域 (Horizon), 例如10步，对应 10 * 0.1 = 1.0秒
         # 车辆轴距 (一个合理的默认值)
         L = ego.bounding_box.extent.x * 2.0
 
-        # 创建一个字典来存储调试信息，避免main函数中引用不存在的key
-        dbg_info = {
-            's': 0.0, 'ey': 0.0, 'lo': 0.0, 'up': 0.0, 'width': 0.0,
-            'v': speed, 'v_ref': self.v_ref_base, 'delta': 0.0,
-            'steer': 0.0, 'throttle': 0.0, 'brake': 0.0
-        }
-
-        # ========== 1. 检查走廊是否存在 ==========
-        if self.corridor is None or len(self.corridor.s) < 2:
-            # 没有走廊信息，直接刹车
-            dbg_info['brake'] = 1.0
-            return 0.0, 0.0, 1.0, dbg_info
-
-        # ========== 2. 横向控制：纯追踪 (Pure Pursuit) ==========
-
-        # a) 确定目标路径 (走廊中线)
-        s_mid = self.corridor.s
-        ey_mid = (self.corridor.upper + self.corridor.lower) / 2.0
-
-        # b) 计算前视距离 L_d
-        k_ld = 0.5  # 前视距离系数
-        L_d = 5.0 + speed * k_ld
-
-        # c) 找到目标点
+        # --- 3. 获取当前状态 (Frenet坐标系) ---
         s_now, ey_now = self.ref.xy2se(x, y)
-        s_target = s_now + L_d
+        # TODO: yaw_err_now 需要根据车辆当前朝向和参考线朝向计算得到
+        yaw_err_now = 0.0  # 简化处理，实际需要计算
+        x0 = np.array([speed, ey_now, yaw_err_now, s_now])
 
-        # 使用插值法找到目标点在走廊中线上的横向偏移ey
-        ey_target = float(np.interp(np.clip(s_target, s_mid[0], s_mid[-1]), s_mid, ey_mid))
+        # --- 4. 定义目标/代价函数 ---
+        def objective_function(u):
+            u = u.reshape((H, 2))
 
-        # d) 将目标点从Frenet坐标系转换到世界坐标系
-        target_x, target_y = self.ref.se2xy(s_target, ey_target)
+            # 权重参数 (方便统一调整)
+            W_CONTROL = 0.1
+            W_CONTROL_RATE = 0.1
+            W_EY = 10.0
+            W_SPEED = 0.5  # 【新增】速度跟踪的权重
 
-        # e) 计算目标点相对于车头方向的角度 alpha
-        vec_to_target_x = target_x - x
-        vec_to_target_y = target_y - y
-        alpha = math.atan2(vec_to_target_y, vec_to_target_x) - yaw_rad
+            # a) 控制量和变化率代价
+            cost_control = np.sum(u[:, 0] ** 2) + np.sum(u[:, 1] ** 2)
+            cost_control_rate = np.sum(np.diff(u[:, 0]) ** 2) + np.sum(np.diff(u[:, 1]) ** 2)
 
-        # f) 计算转向角 delta
-        delta = math.atan2(2.0 * L * math.sin(alpha), L_d)
+            # 【核心修正】在预测过程中累加每一步的代价
+            x_pred = x0.copy()
+            cost_ey_tracking = 0.0
+            cost_speed_tracking = 0.0
 
-        # g) 将转向角转换为 [-1, 1] 的steer值
-        # 假设最大方向盘转角为30度
-        max_steer_angle = math.radians(30.0)
-        steer = float(np.clip(delta / max_steer_angle, -1.0, 1.0))
+            for k in range(H):
+                # 预测下一个状态
+                x_pred += self.vehicle_model_frenet(x_pred, u[k], L) * dt
 
-        # ========== 3. 纵向控制：简单P控制器 ==========
-        v_ref = self.v_ref_base
+                # 【新增】累加每一步的横向偏移代价
+                cost_ey_tracking += x_pred[1] ** 2
 
-        # 简单规则：如果前方走廊很窄，就减速
-        # 找到车辆前方约3-8米处的走廊宽度
-        s_check_start = s_now + 3.0
-        s_check_end = s_now + 8.0
+                # 【新增】累加每一步的速度跟踪代价
+                speed_error = self.v_ref_base - x_pred[0]
+                cost_speed_tracking += speed_error ** 2
 
-        indices = np.where((s_mid >= s_check_start) & (s_mid <= s_check_end))
-        if len(indices[0]) > 0:
-            width_ahead = self.corridor.upper[indices] - self.corridor.lower[indices]
-            min_width_ahead = np.min(width_ahead)
-            if min_width_ahead < L + 0.8:  # 如果宽度小于车宽+0.8米
-                v_ref *= 0.5  # 目标速度减半
+            # 最终总代价
+            total_cost = (cost_control * W_CONTROL +
+                          cost_control_rate * W_CONTROL_RATE +
+                          cost_ey_tracking * W_EY +
+                          cost_speed_tracking * W_SPEED)
 
-        # P控制器
-        error = v_ref - speed
-        kp = 0.4  # 比例系数
-        throttle = kp * error
+            return total_cost
 
-        throttle = float(np.clip(throttle, 0.0, 1.0))
-        brake = 0.0
-        if error < -0.5:  # 如果速度超出目标速度较多，则刹车
+        # --- 5. 定义约束条件 ---
+        cons = []
+        # a) 边界约束
+        for k in range(H):
+            # 不等式约束 c(x) >= 0
+            # upper_bound - ey >= 0  和  ey - lower_bound >= 0
+            # 这里的 x_k 是第k步的预测状态，ey是x_k[1]
+            # 我们需要一个函数来根据s值获取边界
+            def get_bounds_at_s(s, corridor):
+                upper = np.interp(s, corridor.s, corridor.upper)
+                lower = np.interp(s, corridor.s, corridor.lower)
+                return upper, lower
+
+            # 由于约束函数需要以 (u) 为输入，我们需要在内部进行预测
+            def upper_constraint(u, k):
+                u = u.reshape((H, 2))
+                x_pred = x0.copy()
+                for i in range(k + 1):
+                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
+                s_pred, ey_pred = x_pred[3], x_pred[1]
+                upper, _ = get_bounds_at_s(s_pred, self.corridor)
+                return upper - ey_pred  # >= 0
+
+            def lower_constraint(u, k):
+                u = u.reshape((H, 2))
+                x_pred = x0.copy()
+                for i in range(k + 1):
+                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
+                s_pred, ey_pred = x_pred[3], x_pred[1]
+                _, lower = get_bounds_at_s(s_pred, self.corridor)
+                return ey_pred - lower  # >= 0
+
+            cons.append({'type': 'ineq', 'fun': lambda u, k=k: upper_constraint(u, k)})
+            cons.append({'type': 'ineq', 'fun': lambda u, k=k: lower_constraint(u, k)})
+
+        # b) 控制量范围约束
+        accel_min, accel_max = -5.0, 3.0
+        delta_min, delta_max = -math.radians(30), math.radians(30)
+        bounds = [(accel_min, accel_max), (delta_min, delta_max)] * H
+
+        # --- 6. 求解优化问题 ---
+        u_initial_guess = np.zeros(2 * H)  # 初始猜测
+        result = minimize(objective_function, u_initial_guess, bounds=bounds, constraints=cons, method='SLSQP')
+
+        # --- 7. 提取并应用第一个控制指令 ---
+        optimal_u = result.x.reshape((H, 2))
+        optimal_accel = optimal_u[0, 0]
+        optimal_delta = optimal_u[0, 1]
+
+        # --- 8. 将加速度和转角转换为油门和刹车 ---
+        if optimal_accel > 0:
+            throttle = float(np.clip(optimal_accel / accel_max, 0, 1))
+            brake = 0.0
+        else:
             throttle = 0.0
-            brake = float(np.clip(-error * 0.5, 0.0, 1.0))
+            brake = float(np.clip(optimal_accel / accel_min, 0, 1))
 
-        # ========== 4. 更新调试信息并返回 ==========
+        steer = float(np.clip(optimal_delta / delta_max, -1, 1))
+
+        # (返回控制量和调试信息)
         s_idx = np.argmin(np.abs(self.corridor.s - s_now))
-        dbg_info.update({
+        dbg_info = {
             's': s_now, 'ey': ey_now,
             'lo': self.corridor.lower[s_idx], 'up': self.corridor.upper[s_idx],
             'width': self.corridor.upper[s_idx] - self.corridor.lower[s_idx],
-            'v_ref': v_ref, 'delta': delta, 'steer': steer,
+            'v': speed, 'v_ref': self.v_ref_base,  # 使用基础速度作为参考
+            'delta': optimal_delta, 'steer': steer,
             'throttle': throttle, 'brake': brake
-        })
-        # 仅场景测试使用
-        throttle =0
-        brake =1
+        }
         return throttle, steer, brake, dbg_info
-
-
 
 
 # ====== 6) 主程序 ======
@@ -718,7 +704,7 @@ def main():
     logger = None
     try:
         env.setup_scene(
-            num_cones=10, step_forward=3.0, step_right=0.35,
+            num_cones=5, step_forward=3.0, step_right=0.35,
             z_offset=0.0, min_gap_from_junction=15.0,
             grid=5.0, set_spectator=True
         )
@@ -727,12 +713,9 @@ def main():
         ego, ego_wp = spawn_ego_upstream_lane_center(env)
 
         # 如果生成失败，ego_wp 可能是 None，需要处理
-        if ego_wp is None:
-            # 如果首选方案失败，后备方案返回的 ego_wp 是 None
-            # 我们需要根据最终的 ego 位置重新获取一次
-            ego_wp = env.world.get_map().get_waypoint(ego.get_location(),
-                                                      project_to_road=True,
-                                                      lane_type=carla.LaneType.Driving)
+        # ego_wp = env.world.get_map().get_waypoint(ego.get_location(),
+        #                                               project_to_road=True,
+        #                                                       lane_type=carla.LaneType.Driving)
         if ego_wp is None:
             raise RuntimeError("无法为已生成的Ego车辆找到有效的路点。")
 
@@ -741,12 +724,11 @@ def main():
         amap = env.world.get_map()
         ref = LaneRef(amap, seed_wp=ego_wp, step=1.0, max_len=500.0)
 
-        idp = 0.2 #  这里切换周围交通参与者的密度
+        idp = 0.0 #  这里切换周围交通参与者的密度
         scenemanager = SceneManager(ego_wp, idp)
         import ipdb
         # ipdb.set_trace()
         scenemanager.gen_traffic_flow(env.world, ego_wp)
-
 
         planner = RuleBasedPlanner(ref, v_ref_base=12.0)
         logger = TelemetryLogger(out_dir="logs_rule_based")
@@ -759,7 +741,6 @@ def main():
         while True:
             # 1) 更新走廊（始终有线；有障碍则收紧）
             planner.update_corridor_simplified(env.world, ego)
-            draw_corridor(env.world, ref, planner.corridor)
 
             # 2) 控制
             throttle, steer, brake, dbg = planner.compute_control(ego, dt=dt)
