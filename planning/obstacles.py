@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple
 import math
 
-# 识别静态道具（UE5/0.9.15 常见命名）
+# 识别静态道具
 STATIC_HINTS = ("static.prop.", "trafficcone", "traffic_cone", "barrier", "warning")
 
 def _alive(a) -> bool:

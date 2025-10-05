@@ -30,7 +30,6 @@ VEHICLE_TYPE_DICT = {
     'vehicle.nissan.micra': ['car', 'wheel4', 'common', 'czw1'],
     'vehicle.nissan.patrol': ['car', 'suv', 'wheel4', 'common', 'czw1'],
     'vehicle.seat.leon': ['car', 'wheel4', 'common', 'czw1'],
-    'vehicle.tesla.model3': ['car', 'wheel4', 'common', 'czw1'],
     'vehicle.toyota.prius': ['car', 'wheel4', 'common', 'czw1'],
     'vehicle.carlamotors.carlacola': ['truck', 'large', 'wheel4', 'common', 'czw1'],
     'vehicle.tesla.cybertruck': ['truck', 'large', 'wheel4', 'common', 'czw1'],
@@ -310,9 +309,7 @@ class SceneManager():
             while True:
                 is_parkable = current_wp.lane_type == carla.LaneType.Parking or current_wp.lane_type == carla.LaneType.Shoulder
                 if is_parkable and current_wp.lane_id not in processed_lanes:
-                    # 注意：这里我们假设 _traffic_flow_scenario 也能处理停车
-                    # 如果有专门的停车生成函数会更好
-                    # 为了兼容，我们临时修改并恢复 self.wp
+
                     original_wp = self.wp
                     self.wp = current_wp
                     bp_and_transforms = self._traffic_flow_scenario(**scene_cfg)
@@ -349,11 +346,11 @@ class SceneManager():
             #                                                'backward_num': 2},
             #                                     gen_cfg={'name_prefix': 'opposite'})
             # For: 路边停靠车辆 (此函数按原样传递ego_wp)
-            self.right_parking_vehicle_scenario(world, ego_wp,
-                                                scene_cfg={'filters': '+wheel4-large', 'idp': self.idp,
-                                                           'forward_num': 2, 'lane_num': 1},
-                                                gen_cfg={'name_prefix': 'park'})
-
+            # self.right_parking_vehicle_scenario(world, ego_wp,
+            #                                     scene_cfg={'filters': '+wheel4-large', 'idp': self.idp,
+            #                                                'forward_num': 2, 'lane_num': 1},
+            #                                     gen_cfg={'name_prefix': 'park'})
+            #
 
 
     def gen_traffic_flow_low_density(self, world, ego_wp):

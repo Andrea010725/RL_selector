@@ -106,7 +106,7 @@ def spawn_ego_upstream_lane_center(env: HighwayEnv) -> carla.Actor:
             print(f"2. 成功在锥桶位置附近找到可行驶车道的路点: {wp.transform.location}")
 
             # 第三步：循环尝试在路点后方不同距离生成车辆
-            for back in [33.0, 34.0, 35.0]:  # 使用完整的距离列表以提高成功率
+            for back in [37.0, 38.0, 39.0]:  # 使用完整的距离列表以提高成功率
                 print(f"3. 尝试在路点后方 {back}米 处寻找生成点...")
                 prevs = wp.previous(back)
 
@@ -291,147 +291,323 @@ class RuleBasedPlanner:
         self._prev_delta = 0.0
         self._prev_ax = 0.0
 
-    def update_corridor_simplified(self, world, ego, s_ahead=20.0, step=1.0, debug_draw=True):
-        """
-        动态生成前方走廊 (V2 - 修正版)。
-        - 修正了障碍物边界计算错误的问题，确保走廊能正确避开障碍物。
-        - 增大了障碍物的安全边距，使生成的路径更平滑、安全。
-        """
-        import carla
-        import numpy as np
 
+    def update_corridor_simplified(self, world, ego, s_ahead=30.0, ds=1.0, ey_range=8.0, dey=0.15, horizon_T=2.0,
+                                   dt=0.2, debug_draw=True):
+        """
+        使用动态规划在Frenet坐标系下进行路径规划 (V9 - 修正重构逻辑中的障碍物判断基准)
+        """
         if not ego:
             self.corridor = None
             return
 
-        amap = world.get_map()
-        dbg = world.debug
+        ego_width = ego.bounding_box.extent.y * 2.0
+        PASSABLE_WIDTH_THRESHOLD = ego_width + 0.6
+        s0, ey0 = self.ref.xy2se(ego.get_location().x, ego.get_location().y)
+        s_nodes = np.arange(s0, s0 + s_ahead, ds)
+        ey_nodes = np.arange(-ey_range, ey_range + dey, dey)
+        num_s, num_ey = len(s_nodes), len(ey_nodes)
 
-        ego_width = ego.bounding_box.extent.y * 2.0 + 0.4
+        # ================= 2. 构建代价地图 (Cost Map) =================
+        cost_map = np.zeros((num_s, num_ey))
+        W_LANE = 20000.0
+        W_OPPOSITE_LANE = 50000.0
+        W_OFFSET = 50
+        offset_cost = W_OFFSET * (ey_nodes ** 2)
+        cost_map += offset_cost
+        amap = world.get_map()  # 提前获取地图对象
 
-        # ========== 1. 生成参考中心线 (不变) ==========
-        center_waypoints = []
-        current_wp = amap.get_waypoint(ego.get_location(), lane_type=carla.LaneType.Driving)
-        center_waypoints.append(current_wp)
-        for s in np.arange(step, s_ahead + step, step):
-            next_wps = current_wp.next(s)
-            if not next_wps: break
-            current_wp = next_wps[0]  # 这里也需要更新
-            center_waypoints.append(next_wps[0])
+        for i, s in enumerate(s_nodes):
+            s_idx_ref = np.argmin(np.abs(self.ref.s - s))
+            ref_waypoint = self.ref.wps[s_idx_ref]
+            ref_lane_id = ref_waypoint.lane_id
+            half_width = ref_waypoint.lane_width * 0.5
 
-        if len(center_waypoints) < 2:
-            self.corridor = None
-            return
+            # 遍历该s值下的所有横向采样点ey
+            for j, ey_val in enumerate(ey_nodes):
+                # 1. 判断该(s, ey)点是否在当前参考车道内
+                if abs(ey_val) <= half_width:
+                    # 在当前车道内，不施加任何惩罚
+                    continue
 
-        # ========== 2. 核心计算逻辑 (已重构和修正) ==========
-        def calculate_corridor_boundaries(waypoints, available_left_lane, available_right_lane):
-            left_pts, right_pts = [], []
-            cone_actors = world.get_actors().filter('static.prop.trafficcone*')
+                # 2. 对于车道外的点，将其从 (s, ey) 转回世界坐标 (x, y)
+                x, y = self.ref.se2xy(s, ey_val)
 
-            # --- 修正点 1: 增大障碍物安全边距，避免锯齿 ---
-            # 膨胀安全距离，从 0.8 扩大到 1.0
-            OBSTACLE_MARGIN = 1.0
-            LANE_MARGIN = 0.2
+                # 3. 获取该世界坐标点对应的路点信息
+                cell_waypoint = amap.get_waypoint(carla.Location(x=x, y=y),
+                                                  project_to_road=False,
+                                                  lane_type=carla.LaneType.Any)
 
-            for i, wp in enumerate(waypoints):
-                wp_loc = wp.transform.location
-                right_vec = wp.transform.get_right_vector()
+                # 4. 根据路点信息施加惩罚
+                if cell_waypoint is None or cell_waypoint.lane_type != carla.LaneType.Driving:
+                    # 如果该点没有路点信息(在路外)，或者不是可行驶车道
+                    cost_map[i, j] = W_LANE
+                elif cell_waypoint.lane_id * ref_lane_id < 0:
+                    import ipdb
+                    # 如果该点是可行驶车道，但与参考车道方向相反
+                    cost_map[i, j] = W_OPPOSITE_LANE
 
-                # --- a) 确定地图提供的最大可用宽度 ---
-                max_left_width = wp.lane_width * 0.5 - LANE_MARGIN
-                max_right_width = wp.lane_width * 0.5 - LANE_MARGIN
+        actors = world.get_actors()
+        ego_loc = ego.get_location()
+        OBSTACLE_RADIUS_M = 0.8
+        for actor in actors:
+            if actor.id == ego.id or "spectator" in actor.type_id: continue
+            try:
+                loc, type_id = actor.get_location(), actor.type_id
+                if loc.distance(ego_loc) > s_ahead + 10: continue
+            except Exception:
+                continue
+            is_static_prop = type_id.startswith("static.prop.")
+            if is_static_prop:
+                try:
+                    s, ey = self.ref.xy2se(loc.x, loc.y)
+                    s_idx = int((s - s0) / ds)
+                    if not (0 <= s_idx < num_s): continue
+                    indices_to_penalize = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M)[0]
+                    cost_map[s_idx, indices_to_penalize] = float('inf')
+                except IndexError:
+                    continue
 
-                if available_left_lane:
-                    left_lane_wp = wp.get_left_lane()
-                    if left_lane_wp: max_left_width += left_lane_wp.lane_width
-                if available_right_lane:
-                    right_lane_wp = wp.get_right_lane()
-                    if right_lane_wp: max_right_width += right_lane_wp.lane_width
+            # ==================== [新增代码 START] 对动态车辆进行轨迹预测 ====================
+            elif type_id.startswith("vehicle."):
+                # 定义预测参数
+                PREDICTION_HORIZON_S = 2.0  # 向前预测 2.0 秒
+                PREDICTION_STEP_S = 0.2  # 预测时间步长为 0.2 秒
 
-                # --- b) 应用障碍物约束 ---
-                final_left_width = max_left_width
-                final_right_width = max_right_width
+                try:
+                    # 1. 获取该车辆的当前速度和所在路点
+                    vel = actor.get_velocity()
+                    speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
 
-                forward_vec = wp.transform.get_forward_vector()
-                for cone in cone_actors:
-                    vec_to_cone = cone.get_location() - wp_loc
-                    if abs(vec_to_cone.dot(forward_vec)) > step * 1.5: continue
+                    # 如果车辆几乎是静止的，按静态障碍物处理，简化计算
+                    if speed < 0.5:
+                        s, ey = self.ref.xy2se(loc.x, loc.y)
+                        s_idx = int((s - s0) / ds)
+                        if 0 <= s_idx < num_s:
+                            indices = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M + 1.0)[0]  # 给予更大半径
+                            cost_map[s_idx, indices] = float('inf')
+                        continue  # 处理下一个actor
 
-                    dist_lateral = vec_to_cone.dot(right_vec)
+                    amap = world.get_map()
+                    start_wp = amap.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+                    if not start_wp:
+                        continue
 
-                    if dist_lateral < 0:
-                        cone_limit_width = abs(dist_lateral) - OBSTACLE_MARGIN
-                        final_left_width = min(final_left_width, cone_limit_width)
-                    else:
-                        cone_limit_width = dist_lateral - OBSTACLE_MARGIN
-                        final_right_width = min(final_right_width, cone_limit_width)
+                    # 2. 循环预测未来时间点的路径点
+                    for t in np.arange(0.0, PREDICTION_HORIZON_S, PREDICTION_STEP_S):
+                        # 计算在该时间点，车辆沿其车道行驶的距离
+                        dist = speed * t
+                        # 使用CARLA API获取未来路点
+                        # .next(distance) 会返回一个列表，包含沿车道中心线前方`distance`米处的路点
+                        future_wps = start_wp.next(dist)
+                        if not future_wps:
+                            break  # 如果前方没有路了，就停止对该车的预测
 
-                final_left_width = max(0, final_left_width)
-                final_right_width = max(0, final_right_width)
+                        future_wp = future_wps[0]
+                        future_loc = future_wp.transform.location
 
-                # --- c) 根据最终宽度计算边界点 ---
-                left_offset = right_vec * -final_left_width
-                left_pts.append(wp_loc + carla.Location(x=left_offset.x, y=left_offset.y, z=left_offset.z))
+                        # 3. 将预测到的未来位置点，在我们的代价地图上标记为障碍
+                        s, ey = self.ref.xy2se(future_loc.x, future_loc.y)
 
-                right_offset = right_vec * final_right_width
-                right_pts.append(wp_loc + carla.Location(x=right_offset.x, y=right_offset.y, z=right_offset.z))
+                        s_idx = int((s - s0) / ds)
+                        if not (0 <= s_idx < num_s):
+                            continue  # 预测点超出了我们的规划范围
 
-            return left_pts, right_pts
+                        # 确定障碍物影响的ey范围，并设置为无穷大代价
+                        # OBSTACLE_RADIUS_M 可以根据车辆宽度进行调整，这里沿用之前的设置
+                        indices_to_penalize = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M)[0]
+                        cost_map[s_idx, indices_to_penalize] = float('inf')
 
-        default_left_pts, default_right_pts = calculate_corridor_boundaries(center_waypoints, False, False)
+                except Exception as e:
+                    # 捕获可能的异常，例如xy2se转换失败，避免程序崩溃
+                    # print(f"Warning: Failed to predict actor {actor.id}. Error: {e}")
+                    continue
 
-        is_path_blocked = False
-        for i in range(len(default_left_pts)):
-            width = default_left_pts[i].distance(default_right_pts[i])
-            if width < ego_width:
-                is_path_blocked = True
-                break
 
-        final_left_pts, final_right_pts = default_left_pts, default_right_pts
+        # ================= 3. DP求解 =================
+        dp_table = np.full((num_s, num_ey), float('inf'))
+        parent_table = np.zeros((num_s, num_ey), dtype=int)
+        start_ey_idx = np.argmin(np.abs(ey_nodes - ey0))
+        dp_table[0, start_ey_idx] = 0
+        W_STEER, W_JERK = 200.0, 500.0
+        for i in range(1, num_s):
+            for j in range(num_ey):
+                if np.isinf(cost_map[i, j]): continue
+                for k in range(num_ey):
+                    if np.isinf(dp_table[i - 1, k]): continue
+                    ey_curr, ey_prev = ey_nodes[j], ey_nodes[k]
+                    steering_cost = (ey_curr - ey_prev) ** 2
+                    jerk_cost = 0
+                    if i > 1:
+                        ey_grandparent = ey_nodes[parent_table[i - 1, k]]
+                        jerk_cost = (ey_curr - 2 * ey_prev + ey_grandparent) ** 2
+                    transition_cost = W_STEER * steering_cost + W_JERK * jerk_cost
+                    total_cost = dp_table[i - 1, k] + cost_map[i, j] + transition_cost
+                    if total_cost < dp_table[i, j]: dp_table[i, j] = total_cost; parent_table[i, j] = k
 
-        if is_path_blocked:
-            can_go_left = False
-            left_lane = current_wp.get_left_lane()
-            if left_lane and left_lane.lane_type == carla.LaneType.Driving and str(current_wp.lane_change) in ("Left",
-                                                                                                               "Both"):
-                can_go_left = True
+        # ================= 4. 回溯最优路径 =================
+        optimal_path_indices = np.zeros(num_s, dtype=int)
+        if np.isinf(np.min(dp_table[-1, :])):
+            print("[DP Planner] 警告: 路径被完全阻塞!")
+            try:
+                last_s_idx = np.max(np.where(np.any(np.isfinite(dp_table), axis=1))[0])
+            except ValueError:
+                last_s_idx = 0
+            optimal_path_indices[last_s_idx] = np.argmin(dp_table[last_s_idx, :])
+            for i in range(last_s_idx - 1, -1, -1): optimal_path_indices[i] = parent_table[
+                i + 1, optimal_path_indices[i + 1]]
+            optimal_path_indices[last_s_idx:] = optimal_path_indices[last_s_idx]
+        else:
+            optimal_path_indices[-1] = np.argmin(dp_table[-1, :])
+            for i in range(num_s - 2, -1, -1): optimal_path_indices[i] = parent_table[
+                i + 1, optimal_path_indices[i + 1]]
+        optimal_path_ey = ey_nodes[optimal_path_indices]
+        num_valid_s = len(optimal_path_ey)
 
-            can_go_right = False
-            right_lane = current_wp.get_right_lane()
-            if right_lane and right_lane.lane_type == carla.LaneType.Driving and str(current_wp.lane_change) in (
-                    "Right", "Both"):
-                can_go_right = True
+        # ================= 5. [最终修正] 提取、决策、并按明确规则重构走廊 =================
+        initial_upper_ey, initial_lower_ey = np.zeros(num_valid_s), np.zeros(num_valid_s)
+        HIGH_COST_THRESHOLD = W_LANE
+        for i in range(num_valid_s):
+            center_idx = np.argmin(np.abs(ey_nodes - optimal_path_ey[i]))
+            cost_slice = cost_map[i, :]
+            left_idx, right_idx = center_idx, center_idx
+            while left_idx + 1 < num_ey and cost_slice[left_idx + 1] < HIGH_COST_THRESHOLD: left_idx += 1
+            initial_upper_ey[i] = ey_nodes[left_idx]
+            while right_idx - 1 >= 0 and cost_slice[right_idx - 1] < HIGH_COST_THRESHOLD: right_idx -= 1
+            initial_lower_ey[i] = ey_nodes[right_idx]
 
-            if can_go_left or can_go_right:
-                final_left_pts, final_right_pts = calculate_corridor_boundaries(center_waypoints, can_go_left,
-                                                                                can_go_right)
+        corridor_upper_ey = initial_upper_ey.copy()
+        corridor_lower_ey = initial_lower_ey.copy()
 
-        # ========== 4. 可视化 (不变) ==========
-        if debug_draw:
-            z = ego.get_location().z + 0.2
-            life_time = 0.1
-            for i in range(len(final_left_pts) - 1):
-                width = final_left_pts[i].distance(final_right_pts[i])
-                color_left = carla.Color(255, 0, 0) if width < ego_width else carla.Color(64, 255, 255)
-                color_right = carla.Color(255, 0, 0) if width < ego_width else carla.Color(255, 235, 64)
+        #
+        # corridor_width = initial_upper_ey - initial_lower_ey
+        # blocked_indices = np.where(corridor_width < PASSABLE_WIDTH_THRESHOLD)[0]
+        # is_blocked = len(blocked_indices) > 0
+        #
+        # if is_blocked:
+        #     blockage_start_idx = blocked_indices[0] if len(blocked_indices) > 0 else 0
+        #     print(f"[决策] 在索引 {blockage_start_idx} 处发现阻塞。检查相邻车道...")
+        #     amap = world.get_map()
+        #     s_of_blockage = s_nodes[blockage_start_idx]
+        #     x_b, y_b = self.ref.se2xy(s_of_blockage, 0.0)
+        #     decision_wp = amap.get_waypoint(carla.Location(x=x_b, y=y_b), project_to_road=True,
+        #                                     lane_type=carla.LaneType.Driving)
+        #
+        #     can_go_left, can_go_right = False, False
+        #
+        #     # 首先获取当前车道的 lane_id
+        #     current_lane_id = decision_wp.lane_id
+        #
+        #     # --- 检查左侧车道 ---
+        #     import ipdb
+        #     left_lane = decision_wp.get_left_lane()
+        #     # 确保左侧车道存在，并且是可行驶的
+        #     if left_lane and left_lane.lane_type == carla.LaneType.Driving:
+        #         # 新的判断逻辑：通过 lane_id 的符号判断方向是否一致
+        #         # 同向行驶的车道 lane_id 符号相同，因此它们的乘积必然大于0
+        #         if current_lane_id * left_lane.lane_id > 0:
+        #             # 检查路网信息是否允许向左变
+        #              can_go_left = True
+        #
+        #     # --- 检查右侧车道 ---
+        #     right_lane = decision_wp.get_right_lane()
+        #     # 确保右侧车道存在，并且是可行驶的
+        #     if right_lane and right_lane.lane_type == carla.LaneType.Driving:
+        #         # 使用同样的逻辑判断右侧车道
+        #         if current_lane_id * right_lane.lane_id > 0:
+        #             # 检查路网信息是否允许向右变道
+        #             can_go_right = True
+        #
+        #     print(f"[决策] 判断结果: can_go_left={can_go_left}, can_go_right={can_go_right}")
+        #     if can_go_right:
+        #         print("[决策] 右侧车道可用，按最终规则重构走廊！")
+        #         for i in range(blockage_start_idx, num_valid_s):
+        #             s_idx_ref = np.argmin(np.abs(self.ref.s - s_nodes[i]))
+        #             waypoint = self.ref.wps[s_idx_ref]
+        #
+        #             cost_slice = cost_map[i, :]
+        #             obstacle_indices = np.where(np.isinf(cost_slice))[0]
+        #             obstacle_ey_values = ey_nodes[obstacle_indices]
+        #             # ########## 核心修正点 1 ##########
+        #             # 寻找位于车道中心线（ey=0）右侧的障碍物
+        #             right_lane_obstacles = obstacle_ey_values[obstacle_ey_values > 0]
+        #             if len(right_lane_obstacles) > 0:
+        #                 corridor_lower_ey[i] = np.max(right_lane_obstacles)
+        #             else:
+        #                 corridor_lower_ey[i] = initial_lower_ey[i]
+        #
+        #             right_lane_wp = waypoint.get_right_lane()
+        #             if right_lane_wp:
+        #             #     corridor_upper_ey[i] = (waypoint.lane_width * 0.5 + right_lane_wp.lane_width)
+        #             # else:
+        #                 corridor_upper_ey[i] = initial_upper_ey[i]  # Fallback
+        #
+        #             for i in range(1, num_valid_s):
+        #                 corridor_lower_ey[i] = max(corridor_lower_ey[i - 1], corridor_lower_ey[i])
+        #
+        #     elif can_go_left:
+        #         print("[决策] 左侧车道可用，按最终规则重构走廊！")
+        #         for i in range(blockage_start_idx, num_valid_s):
+        #             cost_slice = cost_map[i, :]
+        #             obstacle_indices = np.where(np.isinf(cost_slice))[0]
+        #             obstacle_ey_values = ey_nodes[obstacle_indices]
+        #             # ########## 核心修正点 2 ##########
+        #             s_idx_ref = np.argmin(np.abs(self.ref.s - s_nodes[i]))
+        #             waypoint = self.ref.wps[s_idx_ref]
+        #             import ipdb
+        #             # ipdb.set_trace()
+        #             left_lane_wp = waypoint.get_left_lane()
+        #             if left_lane_wp:
+        #             #     corridor_lower_ey[i] = -(waypoint.lane_width * 0.5 + left_lane_wp.lane_width)
+        #             # else:
+        #                 corridor_lower_ey[i] = initial_lower_ey[i]  # Fallback
+        #
+        #             # 寻找位于车道中心线（ey=0）左侧的障碍物
+        #             left_lane_obstacles = obstacle_ey_values[obstacle_ey_values < 0]
+        #             if len(left_lane_obstacles) > 0:
+        #                 corridor_upper_ey[i] = np.max(left_lane_obstacles)
+        #             else:
+        #                 corridor_upper_ey[i] = initial_upper_ey[i]
+        #
+        #             for i in range(1, num_valid_s):
+        #                     corridor_upper_ey[i] = min(corridor_upper_ey[i - 1], corridor_upper_ey[i])
 
-                p_left_1 = carla.Location(final_left_pts[i].x, final_left_pts[i].y, z)
-                p_left_2 = carla.Location(final_left_pts[i + 1].x, final_left_pts[i + 1].y, z)
-                p_right_1 = carla.Location(final_right_pts[i].x, final_right_pts[i].y, z)
-                p_right_2 = carla.Location(final_right_pts[i + 1].x, final_right_pts[i + 1].y, z)
+        # if not is_blocked:
+        # for i in range(1, num_valid_s):
+        #         corridor_upper_ey[i] = min(corridor_upper_ey[i - 1], corridor_upper_ey[i])
+        #         corridor_lower_ey[i] = max(corridor_lower_ey[i - 1], corridor_lower_ey[i])
 
-                # 正在测试场景 先不用花
-                # dbg.draw_line(p_left_1, p_left_2, thickness=0.1, color=color_left, life_time=life_time,
-                #               persistent_lines=False)
-                # dbg.draw_line(p_right_1, p_right_2, thickness=0.1, color=color_right, life_time=life_time,
-                #               persistent_lines=False)
+        # ================= 6. 可视化与输出 =================
+        corridor_s = s_nodes[:num_valid_s]
+        upper_pts, lower_pts = [], []
+        SAFETY_MARGIN_EY = 0.3
+        for s_val, upper_ey, lower_ey in zip(corridor_s, corridor_upper_ey - SAFETY_MARGIN_EY,
+                                             corridor_lower_ey + SAFETY_MARGIN_EY):
+            ux, uy = self.ref.se2xy(s_val, upper_ey)
+            lx, ly = self.ref.se2xy(s_val, lower_ey)
+            upper_pts.append(carla.Location(x=ux, y=uy))
+            lower_pts.append(carla.Location(x=lx, y=ly))
 
-        # ========== 5) 输出走廊到self.corridor ==========
-        self.corridor = SimpleNamespace(
-            s=np.linspace(0, s_ahead, len(final_left_pts), dtype=float),
-            lower=np.array([p.y for p in final_right_pts], dtype=float),
-            upper=np.array([p.y for p in final_left_pts], dtype=float)
-        )
+        self.corridor = SimpleNamespace(s=corridor_s, lower=corridor_lower_ey, upper=corridor_upper_ey,
+                                        upper_pts_world=upper_pts, lower_pts_world=lower_pts,
+                                        center_path_ey=optimal_path_ey)
+
+        if debug_draw and self.corridor:
+            dbg, life_time = world.debug, 0.2
+            z_offset = ego.get_location().z + 0.2
+            for i in range(len(upper_pts) - 1):
+                width = upper_pts[i].distance(lower_pts[i])
+                is_blocked_viz = width < PASSABLE_WIDTH_THRESHOLD
+                color_upper = carla.Color(255, 0, 0) if is_blocked_viz else carla.Color(64, 255, 255)
+                color_lower = carla.Color(255, 0, 0) if is_blocked_viz else carla.Color(255, 235, 64)
+                p_upper_1 = carla.Location(upper_pts[i].x, upper_pts[i].y, z_offset)
+                p_upper_2 = carla.Location(upper_pts[i + 1].x, upper_pts[i + 1].y, z_offset)
+                p_lower_1 = carla.Location(lower_pts[i].x, lower_pts[i].y, z_offset)
+                p_lower_2 = carla.Location(lower_pts[i + 1].x, lower_pts[i + 1].y, z_offset)
+                dbg.draw_line(p_upper_1, p_upper_2, thickness=0.1, color=color_upper, life_time=life_time,
+                              persistent_lines=False)
+                dbg.draw_line(p_lower_1, p_lower_2, thickness=0.1, color=color_lower, life_time=life_time,
+                              persistent_lines=False)
 
     def compute_control(self, ego: carla.Actor, dt: float = 0.05):
         """
@@ -547,24 +723,30 @@ def main():
             grid=5.0, set_spectator=True
         )
 
-        ego , ego_wp= spawn_ego_upstream_lane_center(env)
-        idp = 0.3 #  这里切换周围交通参与者的密度
+        # 1. 先生成自车，并获取其准确的初始路点
+        ego, ego_wp = spawn_ego_upstream_lane_center(env)
+
+        # 如果生成失败，ego_wp 可能是 None，需要处理
+        if ego_wp is None:
+            # 如果首选方案失败，后备方案返回的 ego_wp 是 None
+            # 我们需要根据最终的 ego 位置重新获取一次
+            ego_wp = env.world.get_map().get_waypoint(ego.get_location(),
+                                                      project_to_road=True,
+                                                      lane_type=carla.LaneType.Driving)
+        if ego_wp is None:
+            raise RuntimeError("无法为已生成的Ego车辆找到有效的路点。")
+
+        # 2. 【核心修改】直接使用自车的路点 ego_wp 作为参考线的种子点
+        print(f"[参考线生成] 使用自车所在位置的路点 {ego_wp.transform.location} 作为参考线起点。")
+        amap = env.world.get_map()
+        ref = LaneRef(amap, seed_wp=ego_wp, step=1.0, max_len=500.0)
+
+        idp = 0.2 #  这里切换周围交通参与者的密度
         scenemanager = SceneManager(ego_wp, idp)
         import ipdb
         # ipdb.set_trace()
         scenemanager.gen_traffic_flow(env.world, ego_wp)
 
-        # 参考线：用第一个锥桶所在驾驶车道作为种子
-        amap = env.world.get_map()
-        first_tf = env.get_first_cone_transform()
-        if first_tf is None:
-            # 兜底：用自车位置投影到Driving车道
-            seed_wp = amap.get_waypoint(ego.get_transform().location,
-                                        project_to_road=True, lane_type=carla.LaneType.Driving)
-        else:
-            seed_wp = amap.get_waypoint(first_tf.location,
-                                        project_to_road=True, lane_type=carla.LaneType.Driving)
-        ref = LaneRef(amap, seed_wp=seed_wp, step=1.0, max_len=500.0)
 
         planner = RuleBasedPlanner(ref, v_ref_base=12.0)
         logger = TelemetryLogger(out_dir="logs_rule_based")
@@ -576,7 +758,7 @@ def main():
         # ipdb.set_trace()
         while True:
             # 1) 更新走廊（始终有线；有障碍则收紧）
-            planner.update_corridor_simplified(env.world, ego, s_ahead=20.0, step=1.0)
+            planner.update_corridor_simplified(env.world, ego)
             draw_corridor(env.world, ref, planner.corridor)
 
             # 2) 控制
