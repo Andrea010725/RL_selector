@@ -117,57 +117,22 @@ def pick_random_start_waypoint(world: carla.World, min_gap_from_junction: float 
             return wp
     return candidates[0]
 
-def place_right_shifted_cones(
-    world: carla.World,
-    start_wp: carla.Waypoint,
-    num_cones: int,
-    step_forward: float,
-    step_right: float,
-    z_offset: float = 0.0,
-    ensure_cross_right_edge: bool = True,
-    margin: float = 0.05,
-) -> Tuple[List[carla.Actor], Optional[carla.Transform]]:
-    if num_cones < 2:
-        raise ValueError("num_cones 至少为 2。")
-    bp = get_cone_blueprint(world)
-    lane_half_width = start_wp.lane_width * 0.5
-    dx_base = -0.5 * start_wp.lane_width
-    if ensure_cross_right_edge:
-        need = (lane_half_width + margin) - dx_base
-        min_step_right = max(need / (num_cones - 1), 1e-3)
-        if step_right < min_step_right:
-            print(f"[提示] step_right={step_right:.3f} 过小，自动放大为 {min_step_right:.3f}")
-            step_right = min_step_right
 
-    actors: List[carla.Actor] = []
-    first_cone_tf: Optional[carla.Transform] = None
+# 假设 get_cone_blueprint 和 shift_location 是您项目中已定义的辅助函数
+# 为了让代码可独立运行，我这里补充一个虚拟的实现
+def get_cone_blueprint(world: carla.World) -> carla.ActorBlueprint:
+    return world.get_blueprint_library().find('static.prop.trafficcone01')
 
-    current_wp = start_wp.next(max(0.25, min(0.5, step_forward * 0.2)))[0]
-    for i in range(num_cones):
-        if i > 0:
-            next_wps = current_wp.next(step_forward)
-            if not next_wps:
-                print(f"[警告] 前方 {step_forward} m 无有效 waypoint，停止于 i={i}.")
-                break
-            current_wp = next_wps[0]
-        wp = current_wp
-        yaw = wp.transform.rotation.yaw
-        center_loc = wp.transform.location
-        dx_right = dx_base + i * step_right
-        cone_loc = shift_location(center_loc, yaw_deg=yaw, dx_right=dx_right, dy_forward=0.0, dz=z_offset)
-        cone_tf = carla.Transform(location=cone_loc, rotation=carla.Rotation(
-            pitch=wp.transform.rotation.pitch, yaw=yaw, roll=wp.transform.rotation.roll))
-        try:
-            cone = world.spawn_actor(bp, cone_tf)
-            with contextlib.suppress(Exception):
-                cone.set_simulate_physics(False)
-            actors.append(cone)
-            if first_cone_tf is None:
-                first_cone_tf = cone_tf
-        except RuntimeError as e:
-            print(f"[错误] i={i} 处生成锥桶失败：{e}")
 
-    return actors, first_cone_tf
+def shift_location(location: carla.Location, yaw_deg: float, dx_right: float, dy_forward: float,
+                   dz: float) -> carla.Location:
+    yaw_rad = math.radians(yaw_deg)
+    final_loc = carla.Location(
+        x=location.x + dy_forward * math.cos(yaw_rad) - dx_right * math.sin(yaw_rad),
+        y=location.y + dy_forward * math.sin(yaw_rad) + dx_right * math.cos(yaw_rad),
+        z=location.z + dz
+    )
+    return final_loc
 
 def set_spectator_to_view_first_cone(
     world: carla.World,
@@ -286,26 +251,24 @@ class HighwayEnv:
         self._sync_cm.__enter__()
         return self
 
-    import carla
-    import random
-    from typing import List, Tuple, Optional
-
     def place_cones_conditionally_behind(self,
-            world: carla.World,
-            start_wp: carla.Waypoint,
-            num_cones: int = 10,
-            step_behind: float = 3.0,
-            step_lateral_per_cone: float = 0.35,
-            z_offset: float = 0.0,
-            lane_margin: float = 0.25  # 锥桶距离车道线边缘的安全距离
-    ) -> Tuple[List[carla.Actor], Optional[carla.Transform]]:
+                                         world: carla.World,
+                                         start_wp: carla.Waypoint,
+                                         num_cones: int = 10,
+                                         step_behind: float = 3.0,
+                                         step_lateral_per_cone: float = 0.35,
+                                         z_offset: float = 0.0,
+                                         lane_margin: float = 0.25  # 锥桶距离车道线边缘的安全距离
+                                         ) -> Tuple[
+        List[carla.Actor], Optional[carla.Transform], Optional[carla.Transform]]:  # 1. 修改返回类型签名
         """
         最终版：自动从车道一侧边缘开始，向另一侧边缘递增偏移放置锥桶。
+        返回: (生成的actor列表, 第一个锥桶的Transform, 最后一个锥桶的Transform)
         """
         cone_blueprint = world.get_blueprint_library().find('static.prop.trafficcone01')
         if not cone_blueprint:
             print("错误：找不到锥桶蓝图 'static.prop.trafficcone01'")
-            return [], None
+            return [], None, None  # 同样修改这里的返回
 
         # ====== 1. 决定整体偏移方向 (逻辑修正) ======
         left_lane_wp = start_wp.get_left_lane()
@@ -318,15 +281,15 @@ class HighwayEnv:
 
         # 如果左侧是可行驶车道，而右侧不是（如路肩），
         # 那么我们应该封锁右侧，引导车辆向左。
-        # 锥桶应从右侧车道线开始，向左进展。所以 multiplier 设为 -1.0
+        # 锥桶应从右侧车道线开始，向左进展。
         if is_left_driving and not is_right_driving:
-            lateral_multiplier = 1.0  # <--- 修正
+            lateral_multiplier = -1.0  # 修正：向左进展 multiplier 应为 -1.0
 
         # 如果右侧是可行驶车道，而左侧不是，
         # 那么我们应该封锁左侧，引导车辆向右。
-        # 锥桶应从左侧车道线开始，向右进展。所以 multiplier 设为 1.0
+        # 锥桶应从左侧车道线开始，向右进展。
         elif is_right_driving and not is_left_driving:
-            lateral_multiplier = 1.0  # <--- 修正
+            lateral_multiplier = 1.0  # 修正：向右进展 multiplier 应为 1.0
 
         # 如果两侧都是可行驶车道（比如在中间车道），则随机选择一侧
         elif is_left_driving and is_right_driving:
@@ -335,6 +298,7 @@ class HighwayEnv:
         # ====== 2. 循环放置锥桶 (自动处理起始点和边界) ======
         cones_spawned = []
         first_cone_transform = None
+        last_cone_transform = None  # 2. 初始化 last_cone_transform 变量
         current_wp = start_wp
 
         for i in range(num_cones):
@@ -346,32 +310,22 @@ class HighwayEnv:
             half_lane_width = current_wp.lane_width * 0.5
 
             # ========================================================== #
-            # ======             最终版核心逻辑 START               ====== #
+            # ======          最终版核心逻辑 START                      ====== #
             # ========================================================== #
-
-            # a) 计算第一个锥桶的起始偏移位置 (在目标方向的相反一侧)
-            # 乘以 -1 来确保起始点在相反一侧
             start_offset_signed = (half_lane_width - lane_margin) * -lateral_multiplier
-
-            # b) 计算从起始点开始的、随 i 增加的递增偏移
             progression_offset = (i * step_lateral_per_cone) * lateral_multiplier
-
-            # c) 将两者相加，得到当前锥桶的期望总偏移
             desired_offset_signed = start_offset_signed + progression_offset
 
-            # d) 边界约束：确保锥桶不会超出车道范围
-            max_left_offset = half_lane_width - lane_margin
-            max_right_offset = -(half_lane_width - lane_margin)
+            # 边界约束
+            max_positive_offset = half_lane_width - lane_margin  # 正方向（左）
+            max_negative_offset = -(half_lane_width - lane_margin)  # 负方向（右）
 
-            # 使用 max 和 min 进行夹逼，确保最终偏移值在 [-max_left, max_left] 区间内
-            # 注意 right 是负数，所以用 max；left 是正数，所以用 min
-            actual_offset_signed = max(max_right_offset, min(max_left_offset, desired_offset_signed))
+            # 使用min/max进行夹逼约束
+            actual_offset_signed = max(max_negative_offset, min(max_positive_offset, desired_offset_signed))
 
-            # e) 构建最终的横向偏移向量
             lateral_offset_vector = right_vector * actual_offset_signed
-
             # ========================================================== #
-            # ======              最终版核心逻辑 END                ====== #
+            # ======          最终版核心逻辑 END                        ====== #
             # ========================================================== #
 
             cone_location = wp_transform.location + lateral_offset_vector
@@ -384,13 +338,17 @@ class HighwayEnv:
                 if first_cone_transform is None:
                     first_cone_transform = cone_transform
 
+                last_cone_transform = cone_transform  # 3. 每次成功生成都更新 last_cone_transform
+
             previous_wps = current_wp.previous(step_behind)
             if previous_wps:
                 current_wp = previous_wps[0]
             else:
+                # 如果找不到上一个waypoint，就结束放置
+                print(f"[警告] 后方 {step_behind} m 无有效 waypoint，停止于第 {i + 1} 个锥桶处。")
                 current_wp = None
 
-        return cones_spawned, first_cone_transform
+        return cones_spawned, first_cone_transform, last_cone_transform  # 4. 在返回值中添加 last_cone_transform
 
     def setup_scene(
             self,
@@ -407,7 +365,7 @@ class HighwayEnv:
         start_wp = pick_random_start_waypoint(self.world, min_gap_from_junction=min_gap_from_junction, grid=grid,
                                               max_tries=300)
 
-        cones, first_tf = self.place_cones_conditionally_behind(
+        cones, first_tf, last_tf = self.place_cones_conditionally_behind(
             world=self.world,
             start_wp=start_wp,
             num_cones=num_cones,
@@ -426,14 +384,19 @@ class HighwayEnv:
         # 注意：这里的 first_tf 现在是“最后方”的那个锥桶的transform
         # 这也符合逻辑，因为车辆应该从这个锥桶后方更远的位置出现
         self._first_cone_tf = first_tf
-        if set_spectator and first_tf is not None:
-            # 这个函数可能需要微调，以确保视角能看到整个锥桶队列
-            set_spectator_to_view_first_cone(self.world, first_tf)
+        self._last_cone_tf = last_tf
+        # if set_spectator and first_tf is not None:
+        #     # 这个函数可能需要微调，以确保视角能看到整个锥桶队列
+        #     # set_spectator_to_view_first_cone(self.world, first_tf)
+        #     set_spectator_fixed(self.world, self.ego)
 
 
     # === 新增：提供第一个锥桶位姿给 agent 用来计算 EGO 的生成位置 ===
     def get_first_cone_transform(self) -> Optional[carla.Transform]:
         return self._first_cone_tf
+
+    def get_last_cone_transform(self) -> Optional[carla.Transform]:
+        return self._last_cone_tf
 
     def get_cone_actors(self) -> List[carla.Actor]:
         return list(self._cones) if hasattr(self, "_cones") else []

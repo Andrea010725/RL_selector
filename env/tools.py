@@ -222,8 +222,8 @@ class SceneManager():
                 self.generated_actors.append(right_actor)
                 if right_actor.type_id.startswith('vehicle'):
                     right_actor.set_autopilot(enabled=True)
-                    # right_actor.set_target_velocity(random.randint(10, 15))   要寫三維的形式
-                    right_actor.apply_control(carla.VehicleControl(throttle=(random.randint(3, 7) / 10)))
+                    right_actor.set_target_velocity(random.randint(10, 15))
+                    # right_actor.apply_control(carla.VehicleControl(throttle=(random.randint(3, 7) / 10)))
                 else:
                     offset_index += 1
                 continue
