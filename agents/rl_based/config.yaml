@@ -1,0 +1,92 @@
+# config.yaml
+gpu_settings:
+  use_gpu: false
+  tf_log_level: 3
+
+# Expert data configuration for pre-training
+expert_data:
+  data_dir: "expert_data"
+  batch_size: 32
+  validation_split: 0.2
+  max_files: null  # Use all files if null
+  shuffle: true
+  normalize_actions: true
+
+# Pre-training configuration
+pretraining:
+  learning_rate: 1.0e-4
+  epochs: 50
+  early_stopping_patience: 10
+  save_best_only: true
+  validation_freq: 1
+
+training:
+  epochs: 60
+  epoch_offset: 0
+  base_config:
+    episodes: 5
+    timesteps: 512
+    batch_size: 68
+    gamma: 0.9999   #99
+    lambda_: 0.999  #9
+    save_every: "end"
+    update_frequency: 1
+    seed: 51
+    polyak: 1.0
+    seed_regularization: true
+    repeat_action: 1
+    load: false
+    load_full: false
+
+  stage_configs:
+    "1":  # Note: using string keys for stage numbers
+      policy_lr: 3.0e-5
+      value_lr: 1.0e-5
+      dynamics_lr: 3.0e-4
+      clip_ratio: 0.2   #0.15
+      entropy_regularization: 0.5  #1.0
+      aug_intensity: 0.0
+    "2":
+      policy_lr: 3.0e-5
+      value_lr: 3.0e-5
+      dynamics_lr: 3.0e-4
+      clip_ratio: 0.15
+      entropy_regularization: 2.0
+      aug_intensity: 0.0
+    "3":
+      policy_lr: 3.0e-5
+      value_lr: 3.0e-5
+      dynamics_lr: 3.0e-4
+      clip_ratio: 0.125
+      entropy_regularization: 1.0
+      aug_intensity: 0.0
+    "4":
+      policy_lr: 1.0e-5
+      value_lr: 1.0e-5
+      dynamics_lr: 3.0e-5
+      clip_ratio: 0.1
+      entropy_regularization: 1.0
+      aug_intensity: 1.0
+    "5":
+      policy_lr: 1.0e-5
+      value_lr: 1.0e-5
+      dynamics_lr: 1.0e-5
+      clip_ratio: 0.1
+      entropy_regularization: 1.0
+      aug_intensity: 0.0
+
+evaluation:
+  towns:
+    - "Town01"
+    - "Town02"
+    - "Town03"
+    - "Town04"
+    - "Town05"
+    - "Town06"
+    - "Town07"
+  traffic_conditions:
+    - "no"
+    - "regular"
+    - "dense"
+  steps: 512
+  seeds: [42]

@@ -1,0 +1,7 @@
+{
+    "scene_type": {
+        "waypoint.is_intersection": 0.0,
+        "waypoint.is_junction": 0.0,
+        "is_at_traffic_light": 0.0
+    }
+}

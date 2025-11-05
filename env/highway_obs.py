@@ -251,104 +251,144 @@ class HighwayEnv:
         self._sync_cm.__enter__()
         return self
 
-    def place_cones_conditionally_behind(self,
-                                         world: carla.World,
-                                         start_wp: carla.Waypoint,
-                                         num_cones: int = 10,
-                                         step_behind: float = 3.0,
-                                         step_lateral_per_cone: float = 0.35,
-                                         z_offset: float = 0.0,
-                                         lane_margin: float = 0.25  # 锥桶距离车道线边缘的安全距离
-                                         ) -> Tuple[
-        List[carla.Actor], Optional[carla.Transform], Optional[carla.Transform]]:  # 1. 修改返回类型签名
+    def place_cones_conditionally_behind(
+            self,
+            world: carla.World,
+            start_wp: carla.Waypoint,
+            num_cones: int = 10,
+            step_behind: float = 3.0,
+            step_lateral_per_cone: float = 0.35,
+            z_offset: float = 0.0,
+            lane_margin: float = 0.25,
+    ) -> Tuple[List[carla.Actor], Optional[carla.Transform], Optional[carla.Transform]]:
         """
-        最终版：自动从车道一侧边缘开始，向另一侧边缘递增偏移放置锥桶。
-        返回: (生成的actor列表, 第一个锥桶的Transform, 最后一个锥桶的Transform)
+        基于 lane_id 正负（同向/反向）与“是否可行驶(Driving)”的判定来放置锥桶。
+        规则：
+          1) 如果某一侧不是 Driving，则封该侧，引导车辆向另一侧。
+          2) 若两侧都是 Driving，则优先封“反向侧”，引导车辆留在同向侧。
+          3) 若两侧同为同向或同为反向（少见），固定封左侧（可按需改成随机）。
+        摆放方式：
+          - 从被封侧的车道边缘起步（贴边但预留 lane_margin），
+          - 每个锥桶横向推进 step_lateral_per_cone，纵向沿 previous(step_behind) 往后摆，
+          - 对贴边点 spawn 失败，做“向内（朝0）微调重试”，保证第一个锥桶尽量贴边。
+        返回: (生成的actor列表, 第一个锥桶Transform, 最后一个锥桶Transform)
         """
-        cone_blueprint = world.get_blueprint_library().find('static.prop.trafficcone01')
+        cone_blueprint = world.get_blueprint_library().find("static.prop.trafficcone01")
         if not cone_blueprint:
             print("错误：找不到锥桶蓝图 'static.prop.trafficcone01'")
-            return [], None, None  # 同样修改这里的返回
+            return [], None, None
 
-        # ====== 1. 决定整体偏移方向 (逻辑修正) ======
-        left_lane_wp = start_wp.get_left_lane()
-        right_lane_wp = start_wp.get_right_lane()
-        is_left_driving = left_lane_wp and left_lane_wp.lane_type == carla.LaneType.Driving
-        is_right_driving = right_lane_wp and right_lane_wp.lane_type == carla.LaneType.Driving
+        def is_driving(wp: Optional[carla.Waypoint]) -> bool:
+            return bool(wp and wp.lane_type == carla.LaneType.Driving)
 
-        # lateral_multiplier: 1.0 表示向右进展, -1.0 表示向左进展
-        lateral_multiplier = 1.0
+        def same_direction(a: carla.Waypoint, b: Optional[carla.Waypoint]) -> bool:
+            """仅用 lane_id 符号判断同/反向；b 为空则返回 False。"""
+            try:
+                return bool(b and int(a.lane_id) * int(b.lane_id) > 0)
+            except Exception:
+                return False
 
-        # 如果左侧是可行驶车道，而右侧不是（如路肩），
-        # 那么我们应该封锁右侧，引导车辆向左。
-        # 锥桶应从右侧车道线开始，向左进展。
-        if is_left_driving and not is_right_driving:
-            lateral_multiplier = -1.0  # 修正：向左进展 multiplier 应为 -1.0
+        cones_spawned: List[carla.Actor] = []
+        first_cone_transform: Optional[carla.Transform] = None
+        last_cone_transform: Optional[carla.Transform] = None
 
-        # 如果右侧是可行驶车道，而左侧不是，
-        # 那么我们应该封锁左侧，引导车辆向右。
-        # 锥桶应从左侧车道线开始，向右进展。
-        elif is_right_driving and not is_left_driving:
-            lateral_multiplier = 1.0  # 修正：向右进展 multiplier 应为 1.0
-
-        # 如果两侧都是可行驶车道（比如在中间车道），则随机选择一侧
-        elif is_left_driving and is_right_driving:
-            lateral_multiplier = random.choice([-1.0, 1.0])
-
-        # ====== 2. 循环放置锥桶 (自动处理起始点和边界) ======
-        cones_spawned = []
-        first_cone_transform = None
-        last_cone_transform = None  # 2. 初始化 last_cone_transform 变量
         current_wp = start_wp
 
         for i in range(num_cones):
             if not current_wp:
                 break
 
-            wp_transform = current_wp.transform
-            right_vector = wp_transform.get_right_vector()
+            wp_tf = current_wp.transform
+            right_vector = wp_tf.get_right_vector()  # 只用于 offset->世界坐标（正=向右）
             half_lane_width = current_wp.lane_width * 0.5
 
-            # ========================================================== #
-            # ======          最终版核心逻辑 START                      ====== #
-            # ========================================================== #
-            start_offset_signed = (half_lane_width - lane_margin) * -lateral_multiplier
-            progression_offset = (i * step_lateral_per_cone) * lateral_multiplier
+            # === 基于 lane_id / Driving 判定“封哪一侧” ===
+            left_lane_wp = current_wp.get_left_lane()
+            right_lane_wp = current_wp.get_right_lane()
+
+            left_is_drv = is_driving(left_lane_wp)
+            right_is_drv = is_driving(right_lane_wp)
+            left_same = same_direction(current_wp, left_lane_wp) if left_is_drv else False
+            right_same = same_direction(current_wp, right_lane_wp) if right_is_drv else False
+
+            # block_side: "left" 表示从左边缘起步并向右推进（封左，引右）
+            #             "right" 表示从右边缘起步并向左推进（封右，引左）
+            if left_is_drv and not right_is_drv:
+                block_side = "right"  # 右侧不可行驶 → 封右
+            elif right_is_drv and not left_is_drv:
+                block_side = "left"  # 左侧不可行驶 → 封左
+            elif left_is_drv and right_is_drv:
+                # 两侧都可行驶：优先封反向侧
+                if left_same and not right_same:
+                    block_side = "right"  # 右为反向 → 封右
+                elif right_same and not left_same:
+                    block_side = "left"  # 左为反向 → 封左
+                else:
+                    block_side = "left"  # 都同向或都反向：固定封左（可改为随机）
+            else:
+                block_side = "left"  # 两侧都不可行驶（边缘/窄道），兜底封左
+
+            # === 按封堵侧计算“起点贴边 + 推进方向” ===
+            if block_side == "left":
+                start_offset_signed = -(half_lane_width - lane_margin)  # 左边缘（负）
+                step_dir = +1.0  # 向右推进   +
+            else:  # "right"
+                start_offset_signed = +(half_lane_width - lane_margin)  # 右边缘（正）
+                step_dir = -1.0  # 向左推进    -
+
+            progression_offset = (i * step_lateral_per_cone) * step_dir
             desired_offset_signed = start_offset_signed + progression_offset
 
-            # 边界约束
-            max_positive_offset = half_lane_width - lane_margin  # 正方向（左）
-            max_negative_offset = -(half_lane_width - lane_margin)  # 负方向（右）
+            # 夹逼到边界内：正=右边缘，负=左边缘
+            max_pos = +(half_lane_width - lane_margin)
+            max_neg = -(half_lane_width - lane_margin)
+            actual_offset_signed = max(max_neg, min(max_pos, desired_offset_signed))
 
-            # 使用min/max进行夹逼约束
-            actual_offset_signed = max(max_negative_offset, min(max_positive_offset, desired_offset_signed))
+            # === 向内微调重试（朝 0 靠拢：左(-)→+；右(+)→-）===
+            cone_actor = None
+            cone_transform = None
 
-            lateral_offset_vector = right_vector * actual_offset_signed
-            # ========================================================== #
-            # ======          最终版核心逻辑 END                        ====== #
-            # ========================================================== #
+            nudge_dir = +1.0 if actual_offset_signed < 0.0 else -1.0
+            NUDGE_STEP = 0.18
+            NUDGE_TRY = 6
 
-            cone_location = wp_transform.location + lateral_offset_vector
-            cone_location.z += z_offset
-            cone_transform = carla.Transform(cone_location, wp_transform.rotation)
+            for k in range(0, NUDGE_TRY + 1):
+                offset_try = actual_offset_signed + k * nudge_dir * NUDGE_STEP
+                offset_try = max(max_neg, min(max_pos, offset_try))
 
-            cone_actor = world.try_spawn_actor(cone_blueprint, cone_transform)
+                rv = wp_tf.get_right_vector()
+                left_vector = carla.Vector3D(-rv.x, -rv.y, -rv.z)  # 显式取反
+
+                cone_loc_try = wp_tf.location + left_vector * offset_try
+                cone_loc_try.z += (z_offset if z_offset != 0.0 else 0.10)  # 稍抬高，减少地面穿插概率
+                cone_tf_try = carla.Transform(cone_loc_try, wp_tf.rotation)
+
+                actor_try = world.try_spawn_actor(cone_blueprint, cone_tf_try)
+                if actor_try:
+                    cone_actor = actor_try
+                    cone_transform = cone_tf_try
+                    break
+
+            # 成功则记录
             if cone_actor:
                 cones_spawned.append(cone_actor)
                 if first_cone_transform is None:
                     first_cone_transform = cone_transform
+                last_cone_transform = cone_transform
 
-                last_cone_transform = cone_transform  # 3. 每次成功生成都更新 last_cone_transform
-
-            previous_wps = current_wp.previous(step_behind)
-            if previous_wps:
-                current_wp = previous_wps[0]
+                # （可选）调试打印
+                # print(f"[Cone #{i}] block={block_side} left_drv={left_is_drv}({left_same}) "
+                #       f"right_drv={right_is_drv}({right_same}) start={start_offset_signed:+.2f} "
+                #       f"used={offset_try:+.2f} (neg=左,pos=右)")
+            # 纵向后退到下一排
+            prevs = current_wp.previous(step_behind)
+            if prevs:
+                current_wp = prevs[0]
             else:
-                # 如果找不到上一个waypoint，就结束放置
                 print(f"[警告] 后方 {step_behind} m 无有效 waypoint，停止于第 {i + 1} 个锥桶处。")
                 current_wp = None
 
-        return cones_spawned, first_cone_transform, last_cone_transform  # 4. 在返回值中添加 last_cone_transform
+        return cones_spawned, first_cone_transform, last_cone_transform
 
     def setup_scene(
             self,
