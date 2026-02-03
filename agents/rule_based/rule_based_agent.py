@@ -4,30 +4,53 @@ import math
 import random
 import sys
 from types import SimpleNamespace
+from typing import Optional, Tuple, Dict, Any, List
+
 from scipy.optimize import minimize
 
-from typing import List, Tuple
-
-sys.path.append("/home/ajifang/czw/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg")
+sys.path.append("/home/ajifang/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg")
 import carla
 import numpy as np
-import ipdb
 
-sys.path.append("/home/ajifang/czw/RL_selector")
+# 你的工程依赖
+sys.path.append("/home/ajifang/RL_selector")
 from env.highway_obs import HighwayEnv, get_ego_blueprint
-from env.tools import SceneManager
+
+# ✅ 导入场景类
+from env.scenarios import JaywalkerScenario, TrimmaScenario, ConstructionLaneChangeScenario
+
+# 交通流工具（如你不需要，可以不启用；但保留不影响）
+sys.path.append("/home/ajifang/Driveadapter_2/tools")
+from custom_eval import TrafficFlowSpawner
+
 from vis_debug import TelemetryLogger
 
 
-# ====== 2) 极简 LaneRef：沿同一条驾驶车道采样，提供 xy<->(s,ey) ======
+# ============================================================
+# 颜色工具
+# ============================================================
+def _col(r, g, b):
+    return carla.Color(int(r), int(g), int(b))
+
+COL_REF   = _col(200, 200, 200)   # 灰：参考线
+COL_LEFT  = _col(255, 0, 255)     # 紫：物理左边界
+COL_RIGHT = _col(50, 220, 50)     # 绿：物理右边界
+COL_DP    = _col(255, 255, 0)     # 黄：DP/NMPC跟踪中心线
+
+
+# ============================================================
+# 1) LaneRef：局部参考线 + Frenet变换 + 曲率（用于 yaw_err 动力学）
+# ============================================================
 class LaneRef:
-    def __init__(self, amap: carla.Map, seed_wp: carla.Waypoint, step: float = 1.0, max_len: float = 500.0):
+    def __init__(self, amap: carla.Map, seed_wp: carla.Waypoint, step: float = 1.0, max_len: float = 200.0):
         pts, wps = [], []
         wp = seed_wp
         guard_ids = (wp.road_id, wp.section_id, wp.lane_id)
+
         dist = 0.0
         pts.append((wp.transform.location.x, wp.transform.location.y))
         wps.append(wp)
+
         while dist < max_len:
             nxts = wp.next(step)
             if not nxts:
@@ -38,54 +61,134 @@ class LaneRef:
             pts.append((wp.transform.location.x, wp.transform.location.y))
             wps.append(wp)
             dist += step
+
         self.P = np.asarray(pts, dtype=float)  # [N,2]
-        d = np.linalg.norm(np.diff(self.P, axis=0), axis=1)
-        self.s = np.concatenate([[0.0], np.cumsum(d)])  # [N]
-        tang = np.diff(self.P, axis=0)
-        tang = np.vstack([tang, tang[-1]])
-        self.tang = tang / (np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9)
-        self.wps = wps  # 保存Waypoints，便于车道宽获取
+        if len(self.P) < 2:
+            self.s = np.array([0.0], dtype=float)
+            self.tang = np.array([[1.0, 0.0]], dtype=float)
+        else:
+            d = np.linalg.norm(np.diff(self.P, axis=0), axis=1)
+            self.s = np.concatenate([[0.0], np.cumsum(d)])  # [N]
+            tang = np.diff(self.P, axis=0)
+            tang = np.vstack([tang, tang[-1]])
+            self.tang = tang / (np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9)
+
+        self.wps = wps
         self.step = float(step)
 
-    def _segment_index_and_t(self, x, y):
+        # 曲率 kappa(s)
+        if len(self.P) < 3:
+            self.kappa = np.zeros(len(self.s), dtype=float)
+        else:
+            psi = np.arctan2(self.tang[:, 1], self.tang[:, 0])  # [N]
+            dpsi = np.diff(psi)
+            dpsi = (dpsi + np.pi) % (2 * np.pi) - np.pi
+            ds_arr = np.diff(self.s) + 1e-9
+            k_mid = dpsi / ds_arr  # [N-1]
+
+            self.kappa = np.zeros(len(self.s), dtype=float)
+            if len(self.s) >= 3:
+                self.kappa[1:-1] = 0.5 * (k_mid[:-1] + k_mid[1:])
+            self.kappa[0] = k_mid[0]
+            self.kappa[-1] = k_mid[-1]
+
+    def kappa_at_s(self, s: float) -> float:
+        if len(self.s) < 2:
+            return 0.0
+        s = float(np.clip(s, self.s[0], self.s[-1]))
+        return float(np.interp(s, self.s, self.kappa))
+
+    def _segment_index_and_t(self, x, y) -> Tuple[int, float, np.ndarray, float]:
         P = self.P
         xy = np.array([x, y], dtype=float)
-        v = xy - P[:-1]
-        seg = P[1:] - P[:-1]
+
+        if len(P) < 2:
+            proj = P[0].copy()
+            dist = float(np.linalg.norm(xy - proj))
+            return 0, 0.0, proj, dist
+
+        v = xy - P[:-1]             # [N-1,2]
+        seg = P[1:] - P[:-1]        # [N-1,2]
         seg_len2 = (seg[:, 0] ** 2 + seg[:, 1] ** 2) + 1e-9
+
         t = np.clip((v[:, 0] * seg[:, 0] + v[:, 1] * seg[:, 1]) / seg_len2, 0.0, 1.0)
         proj = P[:-1] + seg * t[:, None]
         dist2 = np.sum((proj - xy[None, :]) ** 2, axis=1)
-        i = int(np.argmin(dist2))
-        return i, float(t[i]), proj[i]
 
-    def xy2se(self, x: float, y: float):
-        i, t, proj = self._segment_index_and_t(x, y)
-        s_val = self.s[i] + t * (self.s[i + 1] - self.s[i])
-        tx, ty = self.tang[i]
-        # 注意：法向定义不要动（左法向）
+        i = int(np.argmin(dist2))
+        min_dist = float(math.sqrt(dist2[i]))
+        return i, float(t[i]), proj[i], min_dist
+
+    def xy2se(self, x: float, y: float, max_proj_dist: Optional[float] = None) -> Tuple[Optional[float], Optional[float]]:
+        i, t, proj, min_dist = self._segment_index_and_t(x, y)
+        if (max_proj_dist is not None) and (min_dist > max_proj_dist):
+            return None, None
+
+        if len(self.s) < 2:
+            s_val = 0.0
+        else:
+            s_val = self.s[i] + t * (self.s[i + 1] - self.s[i])
+
+        tx, ty = self.tang[min(i, len(self.tang) - 1)]
         nx, ny = -ty, tx
         ey = (x - proj[0]) * nx + (y - proj[1]) * ny
         return float(s_val), float(ey)
 
-    def se2xy(self, s: float, ey: float):
+    def se2xy(self, s: float, ey: float) -> Tuple[float, float]:
+        if len(self.P) < 2:
+            return float(self.P[0, 0]), float(self.P[0, 1])
+
         s = float(np.clip(s, self.s[0], self.s[-1]))
         i = int(np.searchsorted(self.s, s) - 1)
         i = max(0, min(i, len(self.s) - 2))
-        r = (s - self.s[i]) / max(1e-9, self.s[i + 1] - self.s[i])
+
+        ds = max(1e-9, self.s[i + 1] - self.s[i])
+        r = (s - self.s[i]) / ds
+
         base = self.P[i] * (1 - r) + self.P[i + 1] * r
         tx, ty = self.tang[i]
         nx, ny = -ty, tx
+
         x = base[0] + ey * nx
         y = base[1] + ey * ny
         return float(x), float(y)
 
 
-# ====== 3) 生成 EGO：若基于锥桶失败则兜底到地图spawn点 ======
-def spawn_ego_upstream_lane_center(env: HighwayEnv) -> carla.Actor:
-    """
-    在第一个锥桶后方生成EGO，并打印详细的执行步骤。
-    """
+# ============================================================
+# 2) spawn ego - 支持场景和锥桶两种模式
+# ============================================================
+def spawn_ego_from_scenario(world: carla.World, scenario, env: Optional[HighwayEnv] = None) -> Tuple[carla.Actor, carla.Waypoint]:
+    print("\n--- [EGO 场景生成 START] ---")
+    amap = world.get_map()
+    ego_bp = get_ego_blueprint(world)
+
+    spawn_tf = scenario.get_spawn_transform()
+    if spawn_tf is None:
+        raise RuntimeError("场景未能提供有效的 spawn transform")
+
+    print(f"1. 场景提供的生成位置: ({spawn_tf.location.x:.1f}, {spawn_tf.location.y:.1f}, {spawn_tf.location.z:.1f})")
+
+    ego = world.try_spawn_actor(ego_bp, spawn_tf)
+    if ego is None:
+        spawn_tf.location.z += 0.5
+        ego = world.try_spawn_actor(ego_bp, spawn_tf)
+
+    if ego is None:
+        raise RuntimeError(f"无法在场景提供的位置生成 ego: {spawn_tf.location}")
+
+    if env is not None:
+        env.set_ego(ego)
+
+    ego_wp = amap.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+    if ego_wp is None:
+        raise RuntimeError("Ego 生成成功，但无法获取 ego_wp（地图投影失败）")
+
+    print("2. ✅ Ego 成功生成在场景位置")
+    print("--- [EGO 场景生成 END] ---\n")
+    return ego, ego_wp
+
+
+def spawn_ego_upstream_lane_center(env: HighwayEnv) -> Tuple[carla.Actor, carla.Waypoint]:
     print("\n--- [EGO 生成诊断 START] ---")
     world = env.world
     amap = world.get_map()
@@ -102,11 +205,8 @@ def spawn_ego_upstream_lane_center(env: HighwayEnv) -> carla.Actor:
             for back in [37.0, 38.0, 39.0]:
                 print(f"3. 尝试在路点后方 {back}米 处寻找生成点...")
                 prevs = wp.previous(back)
-
                 if prevs:
                     spawn_wp = prevs[0]
-                    print(f"    - 找到候选路点: {spawn_wp.transform.location}")
-
                     tf = carla.Transform(
                         carla.Location(
                             x=spawn_wp.transform.location.x,
@@ -115,112 +215,51 @@ def spawn_ego_upstream_lane_center(env: HighwayEnv) -> carla.Actor:
                         ),
                         carla.Rotation(yaw=float(spawn_wp.transform.rotation.yaw))
                     )
-                    tf_location = carla.Location(
-                        x=spawn_wp.transform.location.x,
-                        y=spawn_wp.transform.location.y,
-                        z=spawn_wp.transform.location.z + 1.0
-                    )
                     ego = world.try_spawn_actor(ego_bp, tf)
                     if ego:
                         env.set_ego(ego)
+                        ego_wp = amap.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+                        if ego_wp is None:
+                            raise RuntimeError("Ego 生成成功，但无法获取 ego_wp（地图投影失败）")
                         print(f"    ✅ [成功] 车辆已在后方 {back}米 处创建！")
                         print("--- [EGO 生成诊断 END] ---\n")
-                        return ego, amap.get_waypoint(tf_location)
-                    else:
-                        print(f"    ❌ [失败] 生成失败。该位置可能被占用或无效。")
-                else:
-                    print(f"    - [跳过] 未能找到后方 {back}米 处的路点（可能道路太短）。")
-        else:
-            print("2. ❌ [失败] 在锥桶位置附近未能找到可行驶车道的路点。")
-    else:
-        print("1. ❌ [失败] 未能获取到第一个锥桶的位置。可能是场景生成失败。")
+                        return ego, ego_wp
 
-    # 后备方案
     print("\n[后备方案] 首选方案失败，现在尝试使用地图默认生成点...")
     spawns = amap.get_spawn_points()
     random.shuffle(spawns)
+
     for i, tf in enumerate(spawns[:10]):
-        print(f"[后备方案] 尝试默认点 #{i + 1}...")
         tf.location.z += 0.20
         ego = world.try_spawn_actor(ego_bp, tf)
         if ego:
             env.set_ego(ego)
+            ego_wp = amap.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+            if ego_wp is None:
+                raise RuntimeError("Ego 默认点生成成功，但无法获取 ego_wp")
             print(f"    ✅ [成功] 车辆已在默认点创建！")
             print("--- [EGO 生成诊断 END] ---\n")
-            return ego, None
+            return ego, ego_wp
 
     print("--- [EGO 生成诊断 END] ---\n")
-    raise RuntimeError("所有方案都已尝试，未能生成EGO。请检查上面的诊断日志确定失败环节。")
+    raise RuntimeError("所有方案都已尝试，未能生成EGO。")
 
 
-# ====== 4) 可行驶区域（走廊）——地图车道线 ======
-def lane_bounds_from_map(world: carla.World, ref: LaneRef, s_arr: np.ndarray, lane_margin: float = 0.20):
-    """
-    对每个 s_i：以地图 Driving 车道宽得到左右边界（ey，左正右负）。
-    返回 (left[], right[])。
-    """
-    amap = world.get_map()
-    left = np.zeros_like(s_arr, dtype=float)
-    right = np.zeros_like(s_arr, dtype=float)
-
-    for i, s in enumerate(s_arr):
-        x, y = ref.se2xy(float(s), 0.0)
-        wp = amap.get_waypoint(
-            carla.Location(x=x, y=y, z=0.0),
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving
-        )
-        if wp is None:
-            w = 3.5
-        else:
-            w = float(getattr(wp, "lane_width", 3.5)) or 3.5
-        half = 0.5 * w
-        left[i] = +half - lane_margin
-        right[i] = -half + lane_margin
-    return left, right
+def spectator_follow_ego(world: carla.World, ego: carla.Actor,
+                         height: float = 8.0, distance_behind: float = 6.0,
+                         pitch: float = -20.0):
+    if ego is None:
+        return
+    tf = ego.get_transform()
+    forward = tf.get_forward_vector()
+    cam_loc = tf.location - forward * distance_behind + carla.Location(z=height)
+    cam_rot = carla.Rotation(pitch=pitch, yaw=tf.rotation.yaw, roll=0.0)
+    world.get_spectator().set_transform(carla.Transform(cam_loc, cam_rot))
 
 
-# ====== 4.x 方向一致性校准：判断“ey>0 是否真的是物理左侧” ======
-def detect_ey_positive_is_left(ref: LaneRef, amap: carla.Map, s_probe: float) -> bool:
-    """
-    用“参考线处最近路点的左邻车道中心”来判定：
-      若该点在 Frenet 下 ey>0 => ey 正方向 = 物理左
-      若 ey<0 => ey 正方向 = 物理右（需要做标签翻转）
-    """
-    # 找 ref 中最靠近 s_probe 的 waypoint
-    idx = int(np.argmin(np.abs(ref.s - s_probe)))
-    wp_center = ref.wps[idx]
-
-    # --- 方案一：优先使用 get_left_lane (最可靠) ---
-    try:
-        wp_left = wp_center.get_left_lane()
-    except Exception:
-        wp_left = None
-
-    if wp_left and wp_left.lane_type == carla.LaneType.Driving:
-        lx, ly = wp_left.transform.location.x, wp_left.transform.location.y
-        _, eyL = ref.xy2se(lx, ly)
-        ok = (eyL > 0.0)
-        print(f"[EY侧校准] 左邻车道中心 ey={eyL:.3f} -> ey>0 是否物理左? {ok}")
-        return ok
-
-    # --- 方案二：如果方案一失败，使用更可靠的几何向量法进行兜底 ---
-    sx, sy = ref.P[idx, 0], ref.P[idx, 1]
-    tx, ty = ref.tang[idx]
-    nx, ny = -ty, tx
-    px, py = sx + 1.0 * nx, sy + 1.0 * ny
-    probe_loc = carla.Location(x=px, y=py, z=wp_center.transform.location.z)
-
-    right_vec = wp_center.transform.get_right_vector()
-    probe_vec = probe_loc - wp_center.transform.location
-    dot_product = probe_vec.x * right_vec.x + probe_vec.y * right_vec.y
-    ok = (dot_product < 0.0)
-
-    print(f"[EY侧校准-兜底] 使用向量法判定, 点积={dot_product:.3f} -> ey>0 是否物理左? {ok}")
-    return ok
-
-
-# ====== 4.1 [最终修正版] 仅用锥桶一侧夹逼 + 宽度不足时把“锥桶对向边界”向外扩 ======
+# ============================================================
+# 5) Corridor：严格 one-sided cones + 连续 cone 边界 + 强制锥桶安全距离
+# ============================================================
 def build_corridor_by_cones_one_side_only(
         world: carla.World,
         ego: carla.Actor,
@@ -230,496 +269,1105 @@ def build_corridor_by_cones_one_side_only(
         lane_margin: float = 0.20,
         cone_margin: float = 0.30,
         min_width: float = 1.8,
-        force_normal_coord: bool = False
+        cone_extra_clearance: float = 0.80,
+        expand_adjacent: bool = False,
+        required_width: Optional[float] = None,
 ):
     amap = world.get_map()
+
     ego_tf = ego.get_transform()
-    s0, _ = ref.xy2se(ego_tf.location.x, ego_tf.location.y)
-    s_nodes = np.arange(s0, s0 + s_ahead, ds)
+    s0, _ = ref.xy2se(ego_tf.location.x, ego_tf.location.y, max_proj_dist=None)
+    if s0 is None:
+        return None
 
-    # === 0) 侧向一致性校准 ===
-    ey_pos_is_left = detect_ey_positive_is_left(ref, amap, s_probe=float(s_nodes[len(s_nodes) // 2]))
-    if force_normal_coord:
-        print("[手动校准] 已强制设定坐标系为正常模式 (ey>0 为物理左)")
-        ey_pos_is_left = True
+    s_nodes = np.arange(float(s0), float(s0) + float(s_ahead), float(ds))
 
-    # === 1) 基础边界（来自地图） ===
-    left_ey_raw, right_ey_raw = lane_bounds_from_map(world, ref, s_nodes, lane_margin=lane_margin)
+    def _lane_bound_points(wp: carla.Waypoint):
+        c = wp.transform.location
+        right_vec = wp.transform.get_right_vector()
+        w = float(getattr(wp, "lane_width", 3.5)) or 3.5
+        half = 0.5 * w
+        left_edge = carla.Location(x=c.x - right_vec.x * half, y=c.y - right_vec.y * half, z=c.z)
+        right_edge = carla.Location(x=c.x + right_vec.x * half, y=c.y + right_vec.y * half, z=c.z)
+        return left_edge, right_edge
 
-    # 将“数学左/右(ey符号)”映射为“物理左/右”标签
-    if ey_pos_is_left:
-        left_ey = left_ey_raw.copy()
-        right_ey = right_ey_raw.copy()
-    else:
-        left_ey = right_ey_raw.copy()
-        right_ey = left_ey_raw.copy()
-    print(f"[侧向映射] ey>0 是否物理左: {ey_pos_is_left} | (left_ey,right_ey) 已按物理左右对齐")
-
-    # === 2) 遍历“锥桶”，只夹逼对应一侧，并记录掩码（按物理左右） ===
-    actors = world.get_actors()
-    s_half_span_idx = max(1, int(0.5 * 1.2 / max(1e-6, ds)))
-
-    cone_left_mask = np.zeros(len(s_nodes), dtype=bool)
-    cone_right_mask = np.zeros(len(s_nodes), dtype=bool)
-
-    print("\n[Corridor-By-Cones] 本周期锥桶侧判定与夹逼如下：")
-    for a in actors:
-        if getattr(a, "id", None) == ego.id: continue
-        tname = getattr(a, "type_id", "").lower()
-        if "spectator" in tname: continue
-        if not tname.startswith("static.prop."): continue
-        name = tname.split("static.prop.")[-1]
-        if ("trafficcone" not in name) and ("traffic_cone" not in name) and ("trafficcone" not in tname): continue
-
-        try:
-            loc = a.get_location()
-            s_obs_math, ey_obs_math = ref.xy2se(loc.x, loc.y)
-        except Exception:
-            continue
-
-        if not (s_nodes[0] - 1.0 <= s_obs_math <= s_nodes[-1] + 1.0): continue
-
-        is_left_cone = (ey_obs_math >= 0.0) if ey_pos_is_left else (ey_obs_math < 0.0)
-        side_str = "LEFT(物理左)" if is_left_cone else "RIGHT(物理右)"
-
-        s_idx_center = int(np.clip((s_obs_math - s_nodes[0]) / max(1e-6, ds), 0, len(s_nodes) - 1))
-        lo_idx, hi_idx = max(0, s_idx_center - s_half_span_idx), min(len(s_nodes) - 1, s_idx_center + s_half_span_idx)
-        print(
-            f"  - cone@ s≈{s_obs_math:.2f}, ey_math≈{ey_obs_math:.2f}  -> 侧别(物理): {side_str} | 影响 s-idx [{lo_idx}, {hi_idx}]")
-
-        target_ey = ey_obs_math - math.copysign(cone_margin, ey_obs_math)
-        for k in range(lo_idx, hi_idx + 1):
-            if is_left_cone:
-                cone_left_mask[k] = True
-                if ey_pos_is_left:
-                    left_ey[k] = min(left_ey[k], target_ey)
-                else:
-                    left_ey[k] = max(left_ey[k], target_ey)
-            else:
-                cone_right_mask[k] = True
-                if ey_pos_is_left:
-                    right_ey[k] = max(right_ey[k], target_ey)
-                else:
-                    right_ey[k] = min(right_ey[k], target_ey)
-
-    # === 3) 宽度不足则外扩：优先“锥桶的对向边界”（按物理左右） ===
-    ego_width = ego.bounding_box.extent.y * 2.0
-    width_thresh = max(min_width, ego_width + 0.30)
-
-    def _drive_ok(wp: carla.Waypoint) -> bool:
-        return (wp is not None) and (wp.lane_type == carla.LaneType.Driving)
+    # 1) 外侧边界
+    left_outer_ey = np.zeros(len(s_nodes), dtype=float)
+    right_outer_ey = np.zeros(len(s_nodes), dtype=float)
+    left_outer_world = []
+    right_outer_world = []
 
     for i, s in enumerate(s_nodes):
-        cur_w = abs(left_ey[i] - right_ey[i])
-        if cur_w >= width_thresh: continue
-
         cx, cy = ref.se2xy(float(s), 0.0)
-        center_location = carla.Location(x=cx, y=cy, z=0.0)
-        center_wp = amap.get_waypoint(center_location, project_to_road=True, lane_type=carla.LaneType.Any)
-
-        if center_wp is None:
-            mid = 0.5 * (left_ey[i] + right_ey[i]);
-            left_ey[i] = mid + 0.5 * width_thresh;
-            right_ey[i] = mid - 0.5 * width_thresh
-            print(f"  * 扩展兜底(center_wp None) @ s_idx={i} -> 对称扩到 {width_thresh:.2f}m")
+        wp_center = amap.get_waypoint(carla.Location(x=cx, y=cy, z=0.0), project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp_center is None:
+            left_outer_ey[i] = +1.75 - lane_margin
+            right_outer_ey[i] = -1.75 + lane_margin
+            left_outer_world.append(carla.Location(x=cx, y=cy, z=0.0))
+            right_outer_world.append(carla.Location(x=cx, y=cy, z=0.0))
             continue
 
-        left_wp, right_wp = center_wp.get_left_lane(), center_wp.get_right_lane()
-        left_ok, right_ok = _drive_ok(left_wp), _drive_ok(right_wp)
+        ego_left_edge, ego_right_edge = _lane_bound_points(wp_center)
 
-        cone_side = 'L' if (cone_left_mask[i] and not cone_right_mask[i]) else \
-            'R' if (cone_right_mask[i] and not cone_left_mask[i]) else None
-
-        expand_side = None
-        if cone_side == 'L':
-            if right_ok:
-                expand_side = 'R'
-            elif left_ok:
-                expand_side = 'L'
-        elif cone_side == 'R':
-            if left_ok:
-                expand_side = 'L'
-            elif right_ok:
-                expand_side = 'R'
+        if not expand_adjacent:
+            left_outer_pt = ego_left_edge
+            right_outer_pt = ego_right_edge
         else:
-            if left_ok:
-                expand_side = 'L'
-            elif right_ok:
-                expand_side = 'R'
+            wp_left = wp_center.get_left_lane()
+            wp_right = wp_center.get_right_lane()
 
-        if expand_side == 'L':
-            adj_w = float(getattr(left_wp, "lane_width", 3.5)) or 3.5
-            left_ey[i] += adj_w if ey_pos_is_left else -adj_w
-            print(f"  * 宽度不足@ s_idx={i}（锥桶侧={cone_side}）-> 向左扩 {adj_w:.2f}m")
-        elif expand_side == 'R':
-            adj_w = float(getattr(right_wp, "lane_width", 3.5)) or 3.5
-            right_ey[i] += -adj_w if ey_pos_is_left else adj_w
-            print(f"  * 宽度不足@ s_idx={i}（锥桶侧={cone_side}）-> 向右扩 {adj_w:.2f}m")
+            if (wp_left is not None) and (wp_left.lane_type == carla.LaneType.Driving):
+                left_edge, _ = _lane_bound_points(wp_left)
+                left_outer_pt = left_edge
+            else:
+                left_outer_pt = ego_left_edge
+
+            if (wp_right is not None) and (wp_right.lane_type == carla.LaneType.Driving):
+                _, right_edge = _lane_bound_points(wp_right)
+                right_outer_pt = right_edge
+            else:
+                right_outer_pt = ego_right_edge
+
+        right_vec = wp_center.transform.get_right_vector()
+
+        left_outer_pt_in = carla.Location(
+            x=left_outer_pt.x + right_vec.x * lane_margin,
+            y=left_outer_pt.y + right_vec.y * lane_margin,
+            z=left_outer_pt.z
+        )
+        right_outer_pt_in = carla.Location(
+            x=right_outer_pt.x - right_vec.x * lane_margin,
+            y=right_outer_pt.y - right_vec.y * lane_margin,
+            z=right_outer_pt.z
+        )
+
+        _, ey_L_in = ref.xy2se(left_outer_pt_in.x, left_outer_pt_in.y, max_proj_dist=None)
+        _, ey_R_in = ref.xy2se(right_outer_pt_in.x, right_outer_pt_in.y, max_proj_dist=None)
+
+        left_outer_ey[i] = float(ey_L_in)
+        right_outer_ey[i] = float(ey_R_in)
+        left_outer_world.append(left_outer_pt_in)
+        right_outer_world.append(right_outer_pt_in)
+
+    # 2) 收集锥桶
+    cones = []
+    for a in world.get_actors():
+        if getattr(a, "id", None) == ego.id:
+            continue
+        tname = (getattr(a, "type_id", "") or "").lower()
+        if not tname.startswith("static.prop."):
+            continue
+        if ("trafficcone" not in tname) and ("traffic_cone" not in tname):
+            continue
+
+        loc = a.get_location()
+        wp = amap.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp is None:
+            continue
+
+        right_vec = wp.transform.get_right_vector()
+        center = wp.transform.location
+        dot = (loc.x - center.x) * right_vec.x + (loc.y - center.y) * right_vec.y
+        side = "RIGHT" if dot > 0.0 else "LEFT"
+
+        s_cone, ey_cone = ref.xy2se(loc.x, loc.y, max_proj_dist=None)
+        if s_cone is None:
+            continue
+        cones.append((float(s_cone), float(ey_cone), side, loc))
+
+    if len(cones) == 0:
+        left_phys = left_outer_ey.copy()
+        right_phys = right_outer_ey.copy()
+        bound_upper = np.maximum(left_phys, right_phys)
+        bound_lower = np.minimum(left_phys, right_phys)
+        return dict(
+            s_nodes=s_nodes,
+            left_phys=left_phys,
+            right_phys=right_phys,
+            bound_upper=bound_upper,
+            bound_lower=bound_lower,
+            bound_upper_safe=bound_upper.copy(),
+            bound_lower_safe=bound_lower.copy(),
+            upper_pts_world=left_outer_world[:],
+            lower_pts_world=right_outer_world[:],
+            mode="NONE",
+            cone_boundary_ey=np.full(len(s_nodes), np.nan, dtype=float),
+            min_width_safe=float(np.min(bound_upper - bound_lower)),
+            expanded=bool(expand_adjacent),
+        )
+
+    cnt_R = sum(1 for (_, _, side, _) in cones if side == "RIGHT")
+    cnt_L = sum(1 for (_, _, side, _) in cones if side == "LEFT")
+
+    if cnt_R > cnt_L:
+        mode = "RIGHT"
+    elif cnt_L > cnt_R:
+        mode = "LEFT"
+    else:
+        cones_sorted = sorted(cones, key=lambda x: abs(x[0] - float(s0)))
+        mode = cones_sorted[0][2]
+
+    print(f"\n[Corridor-By-Cones] cones 侧判定：LEFT={cnt_L}, RIGHT={cnt_R} -> mode={mode}\n")
+
+    # 3) 连续 cone 边界：按 s 插值
+    cones_side = [(sc, ey, loc) for (sc, ey, side, loc) in cones if side == mode]
+    cones_side.sort(key=lambda x: x[0])
+    sc_list = np.array([c[0] for c in cones_side], dtype=float)
+    ey_list = np.array([c[1] for c in cones_side], dtype=float)
+
+    cone_boundary_ey = np.full(len(s_nodes), np.nan, dtype=float)
+    if len(sc_list) >= 2:
+        s_min, s_max = float(sc_list[0]), float(sc_list[-1])
+        mask = (s_nodes >= s_min) & (s_nodes <= s_max)
+        cone_boundary_ey[mask] = np.interp(s_nodes[mask], sc_list, ey_list)
+    else:
+        s_only = float(sc_list[0])
+        mask = np.abs(s_nodes - s_only) <= 2.0
+        cone_boundary_ey[mask] = float(ey_list[0])
+
+    def _smooth_nan_aware(arr, k=7):
+        a = arr.copy()
+        idx = np.where(np.isfinite(a))[0]
+        if len(idx) < 3:
+            return a
+        filled = a.copy()
+        last = None
+        for i in range(len(filled)):
+            if np.isfinite(filled[i]):
+                last = filled[i]
+            elif last is not None:
+                filled[i] = last
+        last = None
+        for i in range(len(filled) - 1, -1, -1):
+            if np.isfinite(filled[i]):
+                last = filled[i]
+            elif last is not None:
+                filled[i] = last
+        ker = np.ones(k, dtype=float) / float(k)
+        sm = np.convolve(filled, ker, mode="same")
+        out = a.copy()
+        out[np.isfinite(a)] = sm[np.isfinite(a)]
+        return out
+
+    cone_boundary_ey = _smooth_nan_aware(cone_boundary_ey, k=7)
+
+    # 4) 把 cone 边界按物理方向推开 cone_margin
+    for i, s in enumerate(s_nodes):
+        ey = cone_boundary_ey[i]
+        if not np.isfinite(ey):
+            continue
+
+        cx, cy = ref.se2xy(float(s), 0.0)
+        wp_center = amap.get_waypoint(carla.Location(x=cx, y=cy, z=0.0), project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp_center is None:
+            continue
+
+        right_vec = wp_center.transform.get_right_vector()
+        px, py = ref.se2xy(float(s), float(ey))
+
+        if mode == "RIGHT":
+            p = carla.Location(x=px + right_vec.x * cone_margin, y=py + right_vec.y * cone_margin, z=wp_center.transform.location.z)
         else:
-            mid = 0.5 * (left_ey[i] + right_ey[i]);
-            left_ey[i] = mid + 0.5 * width_thresh;
-            right_ey[i] = mid - 0.5 * width_thresh
-            print(f"  * 宽度不足@ s_idx={i}（锥桶侧={cone_side}）-> 两侧不可扩，对称扩到 {width_thresh:.2f}m")
+            p = carla.Location(x=px - right_vec.x * cone_margin, y=py - right_vec.y * cone_margin, z=wp_center.transform.location.z)
 
-        cur_w = abs(left_ey[i] - right_ey[i])
-        if cur_w < width_thresh:
-            mid = 0.5 * (left_ey[i] + right_ey[i]);
-            left_ey[i] = mid + 0.5 * width_thresh;
-            right_ey[i] = mid - 0.5 * width_thresh
-            print(f"    - 二次兜底 @ s_idx={i} -> 对称扩到 {width_thresh:.2f}m")
+        _, ey_in = ref.xy2se(p.x, p.y, max_proj_dist=None)
+        cone_boundary_ey[i] = float(ey_in)
 
-    # === 4) 可视化点（物理左=upper，物理右=lower） ===
-    upper_pts_world, lower_pts_world = [], []
-    for s_val, up_ey, lo_ey in zip(s_nodes, left_ey, right_ey):
-        ux, uy = ref.se2xy(s_val, up_ey)
-        lx, ly = ref.se2xy(s_val, lo_ey)
-        upper_pts_world.append(carla.Location(x=ux, y=uy))
-        lower_pts_world.append(carla.Location(x=lx, y=ly))
+    # 5) 生成 corridor 两端 + 安全走廊
+    endA_ey = np.zeros(len(s_nodes), dtype=float)
+    endB_ey = np.zeros(len(s_nodes), dtype=float)
+    endA_world, endB_world = [], []
+    other_side_ey = np.zeros(len(s_nodes), dtype=float)
 
-    return s_nodes, left_ey, right_ey, upper_pts_world, lower_pts_world
+    for i, s in enumerate(s_nodes):
+        cey = cone_boundary_ey[i]
+        if not np.isfinite(cey):
+            a_ey = left_outer_ey[i]
+            b_ey = right_outer_ey[i]
+            other_side_ey[i] = (right_outer_ey[i] if mode == "RIGHT" else left_outer_ey[i])
+        else:
+            if mode == "RIGHT":
+                a_ey = cey
+                b_ey = right_outer_ey[i]
+                other_side_ey[i] = right_outer_ey[i]
+            else:
+                a_ey = left_outer_ey[i]
+                b_ey = cey
+                other_side_ey[i] = left_outer_ey[i]
+
+        endA_ey[i] = float(a_ey)
+        endB_ey[i] = float(b_ey)
+        ax, ay = ref.se2xy(float(s), float(a_ey))
+        bx, by = ref.se2xy(float(s), float(b_ey))
+        endA_world.append(carla.Location(x=ax, y=ay, z=0.0))
+        endB_world.append(carla.Location(x=bx, y=by, z=0.0))
+
+    # 物理左/右（用于画图）
+    left_phys = np.zeros(len(s_nodes), dtype=float)
+    right_phys = np.zeros(len(s_nodes), dtype=float)
+    left_pts_world, right_pts_world = [], []
+
+    for i, s in enumerate(s_nodes):
+        cx, cy = ref.se2xy(float(s), 0.0)
+        wp_center = amap.get_waypoint(carla.Location(x=cx, y=cy, z=0.0), project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp_center is None:
+            left_phys[i] = endA_ey[i]
+            right_phys[i] = endB_ey[i]
+            left_pts_world.append(endA_world[i])
+            right_pts_world.append(endB_world[i])
+            continue
+
+        right_vec = wp_center.transform.get_right_vector()
+        center = wp_center.transform.location
+
+        A = endA_world[i]
+        B = endB_world[i]
+        dotA = (A.x - center.x) * right_vec.x + (A.y - center.y) * right_vec.y
+        dotB = (B.x - center.x) * right_vec.x + (B.y - center.y) * right_vec.y
+
+        if dotA <= dotB:
+            left_phys[i] = endA_ey[i]
+            right_phys[i] = endB_ey[i]
+            left_pts_world.append(A)
+            right_pts_world.append(B)
+        else:
+            left_phys[i] = endB_ey[i]
+            right_phys[i] = endA_ey[i]
+            left_pts_world.append(B)
+            right_pts_world.append(A)
+
+    bound_upper = np.maximum(left_phys, right_phys)
+    bound_lower = np.minimum(left_phys, right_phys)
+
+    # 6) 强制锥桶安全距离
+    ego_width = float(ego.bounding_box.extent.y * 2.0)
+    cone_clear = float(cone_margin + 0.5 * ego_width + cone_extra_clearance)
+
+    bound_upper_safe = bound_upper.copy()
+    bound_lower_safe = bound_lower.copy()
+
+    for i in range(len(s_nodes)):
+        cey = cone_boundary_ey[i]
+        oey = other_side_ey[i]
+        if not np.isfinite(cey):
+            continue
+        if oey > cey:
+            bound_lower_safe[i] = max(bound_lower_safe[i], cey + cone_clear)
+        else:
+            bound_upper_safe[i] = min(bound_upper_safe[i], cey - cone_clear)
+
+        if bound_upper_safe[i] <= bound_lower_safe[i]:
+            mid = 0.5 * (bound_upper[i] + bound_lower[i])
+            bound_upper_safe[i] = mid + 0.3
+            bound_lower_safe[i] = mid - 0.3
+
+    # 车辆挤占（静态当前帧）
+    car_clear_lat = 0.5 * ego_width + 0.30
+    car_influence_s = 8.0
+    for a in world.get_actors():
+        if getattr(a, "id", None) == ego.id:
+            continue
+        tname = (getattr(a, "type_id", "") or "").lower()
+        if not tname.startswith("vehicle."):
+            continue
+        loc = a.get_location()
+        s_car, ey_car = ref.xy2se(loc.x, loc.y, max_proj_dist=None)
+        if s_car is None:
+            continue
+        for i, s in enumerate(s_nodes):
+            if abs(float(s) - float(s_car)) > car_influence_s:
+                continue
+            if ey_car >= 0.0:
+                bound_lower_safe[i] = max(bound_lower_safe[i], float(ey_car) + car_clear_lat)
+            else:
+                bound_upper_safe[i] = min(bound_upper_safe[i], float(ey_car) - car_clear_lat)
+
+            if bound_upper_safe[i] <= bound_lower_safe[i]:
+                mid = 0.5 * (bound_upper[i] + bound_lower[i])
+                bound_upper_safe[i] = mid + 0.3
+                bound_lower_safe[i] = mid - 0.3
+
+    # 7) 最小宽度兜底
+    width_thresh = max(float(min_width), float(ego_width + 0.20))
+    for i in range(len(s_nodes)):
+        w = float(bound_upper_safe[i] - bound_lower_safe[i])
+        if w >= width_thresh:
+            continue
+        mid = 0.5 * (bound_upper_safe[i] + bound_lower_safe[i])
+        bound_upper_safe[i] = mid + 0.5 * width_thresh
+        bound_lower_safe[i] = mid - 0.5 * width_thresh
+
+    min_width_safe = float(np.min(bound_upper_safe - bound_lower_safe))
+
+    return dict(
+        s_nodes=s_nodes,
+        left_phys=left_phys,
+        right_phys=right_phys,
+        bound_upper=bound_upper,
+        bound_lower=bound_lower,
+        bound_upper_safe=bound_upper_safe,
+        bound_lower_safe=bound_lower_safe,
+        upper_pts_world=left_pts_world,
+        lower_pts_world=right_pts_world,
+        mode=mode,
+        cone_boundary_ey=cone_boundary_ey,
+        min_width_safe=min_width_safe,
+        expanded=bool(expand_adjacent),
+    )
 
 
-def _col(r, g, b): return carla.Color(int(r), int(g), int(b))
+# ============================================================
+# 6) DP：生成 center_path_ey（黄色线）+ blocked_intervals(动态预测障碍物)
+# ============================================================
+def dp_plan_centerline(
+    world: carla.World,
+    ego: carla.Actor,
+    ref: LaneRef,
+    s_nodes: np.ndarray,
+    bound_upper: np.ndarray,
+    bound_lower: np.ndarray,
+    *,
+    ey_range: float = 6.0,
+    dey: float = 0.15,
+    corridor_margin: float = 0.20,
+    W_CENTER: float = 2.0,
+    W_SMOOTH: float = 12.0,
+    fallback_to_mid: bool = True,
+    blocked_intervals: Optional[List[List[Tuple[float, float]]]] = None,  # len==Ns, each=[(lo,up)...]
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    INF = 1e18
+    ey_grid = np.arange(-ey_range, ey_range + 1e-6, dey, dtype=float)
+    Ny = len(ey_grid)
+    Ns = len(s_nodes)
+
+    ego_loc = ego.get_location()
+    ego_wp = world.get_map().get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    lane_w = float(getattr(ego_wp, "lane_width", 3.5)) if ego_wp is not None else 3.5
+    max_proj_dist = 1.2 * lane_w + 1.0
+
+    s0, ey0 = ref.xy2se(ego_loc.x, ego_loc.y, max_proj_dist=max_proj_dist)
+    if s0 is None:
+        if fallback_to_mid:
+            return 0.5 * (bound_upper + bound_lower), {"dp_ok": False, "reason": "ego_out_of_ref"}
+        return np.zeros(Ns), {"dp_ok": False, "reason": "ego_out_of_ref"}
+
+    j_start = int(np.argmin(np.abs(ey_grid - float(ey0))))
+    cost = np.full((Ns, Ny), INF, dtype=float)
+
+    for i in range(Ns):
+        lo = float(bound_lower[i]) + corridor_margin
+        up = float(bound_upper[i]) - corridor_margin
+        if up <= lo:
+            lo = float(bound_lower[i])
+            up = float(bound_upper[i])
+
+        valid = (ey_grid >= lo) & (ey_grid <= up)
+
+        # 扣掉动态障碍物禁行区间
+        if blocked_intervals is not None and i < len(blocked_intervals):
+            for (blo, bup) in blocked_intervals[i]:
+                valid &= ~((ey_grid >= float(blo)) & (ey_grid <= float(bup)))
+
+        mid = 0.5 * (lo + up)
+
+        if not np.any(valid):
+            j_mid = int(np.argmin(np.abs(ey_grid - mid)))
+            valid[:] = False
+            valid[j_mid] = True
+
+        cost[i, valid] = W_CENTER * ((ey_grid[valid] - mid) ** 2)
+
+    if not np.isfinite(cost[0, j_start]) or cost[0, j_start] >= INF * 0.5:
+        if fallback_to_mid:
+            return 0.5 * (bound_upper + bound_lower), {"dp_ok": False, "reason": "start_infeasible"}
+        return np.zeros(Ns), {"dp_ok": False, "reason": "start_infeasible"}
+
+    dp = np.full((Ns, Ny), INF, dtype=float)
+    prev = np.full((Ns, Ny), -1, dtype=int)
+    dp[0, j_start] = cost[0, j_start]
+
+    K = 3
+    for i in range(1, Ns):
+        for j in range(Ny):
+            if cost[i, j] >= INF * 0.5:
+                continue
+            j_lo = max(0, j - K)
+            j_hi = min(Ny - 1, j + K)
+            best, bestp = INF, -1
+            for jp in range(j_lo, j_hi + 1):
+                if dp[i - 1, jp] >= INF * 0.5:
+                    continue
+                dy = ey_grid[j] - ey_grid[jp]
+                v = dp[i - 1, jp] + cost[i, j] + W_SMOOTH * (dy * dy)
+                if v < best:
+                    best, bestp = v, jp
+            dp[i, j] = best
+            prev[i, j] = bestp
+
+    j_end = int(np.argmin(dp[-1]))
+    if not np.isfinite(dp[-1, j_end]) or dp[-1, j_end] >= INF * 0.5:
+        if fallback_to_mid:
+            return 0.5 * (bound_upper + bound_lower), {"dp_ok": False, "reason": "dp_inf"}
+        return np.zeros(Ns), {"dp_ok": False, "reason": "dp_inf"}
+
+    j_path = np.zeros(Ns, dtype=int)
+    j_path[-1] = j_end
+    for i in range(Ns - 1, 0, -1):
+        j_path[i - 1] = prev[i, j_path[i]]
+        if j_path[i - 1] < 0:
+            if fallback_to_mid:
+                return 0.5 * (bound_upper + bound_lower), {"dp_ok": False, "reason": "backtrack_fail"}
+            break
+
+    ey_ref = ey_grid[j_path].astype(float)
+    return ey_ref, {"dp_ok": True, "min_cost": float(dp[-1, j_end])}
 
 
-# 参考线与中心线
-COL_REF = _col(200, 200, 200)  # 参考线：浅灰
-COL_CENTER = _col(255, 255, 255)  # 中心线：白
-
-# 左/右边界：颜色区分明显（物理左=洋红，物理右=亮绿）
-COL_LEFT = _col(255, 0, 255)  # 物理左（upper）
-COL_RIGHT = _col(50, 220, 50)  # 物理右（lower）
-
-
-# ====== 5) 规则型 Planner（中线跟随 + 边界保护 + 简易速度）======
+# ============================================================
+# 7) RuleBasedPlanner：动态参考线 + corridor + DP + 软约束NMPC
+# ============================================================
 class RuleBasedPlanner:
-    def __init__(self, ref: LaneRef, v_ref_base: float = 12.0):
-        self.ref = ref
+    """
+    ✅ 关键恢复点：
+    - Planner 持有 amap
+    - 每次 update_corridor 都从 ego 重建参考线 ref（避免 ego_out_of_ref 一启动就退出）
+    - 保留 blocked_intervals（动态障碍物预测 tube）
+    """
+    def __init__(self, amap: carla.Map, v_ref_base: float = 12.0):
+        self.amap = amap
         self.v_ref_base = float(v_ref_base)
+        self.ref: Optional[LaneRef] = None
         self.corridor = None
-        self._prev_delta = 0.0
-        self._prev_ax = 0.0
 
-        # ---- Debug draw toggles ----
         self.DRAW_REF_LINE = True
         self.DRAW_CORRIDOR_EDGES = True
         self.DRAW_DP_CENTER = True
-        self.DRAW_OBS_PRED_POINTS = False  # 关闭障碍点可视化
-        self.DEBUG_LIFE_TIME = 0.8
 
-    def update_corridor_simplified(
-            self, world, ego,
-            s_ahead=30.0, ds=1.0,
-            ey_range=8.0, dey=0.15,
-            horizon_T=2.0, dt=0.2,
-            debug_draw=True,
-            force_normal_coord: bool = False
-    ):
-        """
-        极简版：不做 DP。
-        规则（以物理左/右为准）：
-          1) 只按“锥桶所在侧”向内夹逼该侧边界；另一侧不动；
-          2) 若局部宽度不足，优先将“锥桶的对向边界向外扩”一个相邻 Driving 车道宽；
-          3) 可视化：物理左(洋红)、物理右(亮绿)、中心(白)；无数值标注。
-        """
-        if not ego:
+        self.DRAW_PERIOD = 0.10
+        self.DEBUG_LIFE_TIME = 0.12
+        self._last_draw_t = -1e9
+
+        self.DP_ENABLE = True
+        self.DP_EY_RANGE = 6.0
+        self.DP_DEY = 0.15
+        self.DP_CORRIDOR_MARGIN = 0.10
+        self.DP_W_CENTER = 2.0
+        self.DP_W_SMOOTH = 18.0
+        self._dp_dbg = {}
+
+        self.LANE_MARGIN = 0.20
+        self.CONE_MARGIN = 0.45
+        self.CONE_EXTRA_CLEAR = 0.2
+
+        # 动态预测障碍物开关
+        self.ENABLE_DYNAMIC_BLOCK = True
+
+        self._u_prev = None
+        self.WHEELBASE = 2.7
+        self._max_steer_rad: Optional[float] = None
+        self._steer_prev = 0.0
+
+    def _ensure_vehicle_params(self, ego: carla.Vehicle):
+        if self._max_steer_rad is not None:
+            return
+        try:
+            pc = ego.get_physics_control()
+            max_deg = max(w.max_steer_angle for w in pc.wheels)
+            self._max_steer_rad = float(math.radians(max_deg))
+        except Exception:
+            self._max_steer_rad = float(math.radians(30.0))
+
+    def rebuild_ref_from_ego(self, ego: carla.Actor, step: float = 1.0, max_len: float = 220.0) -> bool:
+        ego_wp = self.amap.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+        if ego_wp is None:
+            self.ref = None
+            return False
+        self.ref = LaneRef(self.amap, ego_wp, step=step, max_len=max_len)
+        return len(self.ref.P) >= 2
+
+    def _merge_intervals(self, intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if not intervals:
+            return []
+        intervals = sorted(intervals, key=lambda x: x[0])
+        merged = [list(intervals[0])]
+        for a, b in intervals[1:]:
+            if a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        return [(float(a), float(b)) for a, b in merged]
+
+    def _predict_blocked_intervals(
+        self,
+        world: carla.World,
+        ego: carla.Actor,
+        s_nodes: np.ndarray,
+        *,
+        T_pred: float = 2.5,
+        dt_pred: float = 0.4,
+        s_band: float = 3.0,
+        veh_lat_buffer: float = 0.6,
+        ped_lat_buffer: float = 0.9,
+        static_v_thresh: float = 0.2,
+    ) -> List[List[Tuple[float, float]]]:
+        if self.ref is None:
+            return [[] for _ in range(len(s_nodes))]
+
+        blocked: List[List[Tuple[float, float]]] = [[] for _ in range(len(s_nodes))]
+        s_nodes = np.asarray(s_nodes, dtype=float)
+
+        def add_block_at_s(s_val, ey_val, lat_radius):
+            s_lo = float(s_val) - float(s_band)
+            s_hi = float(s_val) + float(s_band)
+            idx = np.where((s_nodes >= s_lo) & (s_nodes <= s_hi))[0]
+            if len(idx) == 0:
+                return
+            lo = float(ey_val) - float(lat_radius)
+            up = float(ey_val) + float(lat_radius)
+            for ii in idx:
+                blocked[ii].append((lo, up))
+
+        for a in world.get_actors():
+            if getattr(a, "id", None) == ego.id:
+                continue
+            t = (getattr(a, "type_id", "") or "").lower()
+            is_vehicle = t.startswith("vehicle.")
+            is_ped = t.startswith("walker.pedestrian")
+            if (not is_vehicle) and (not is_ped):
+                continue
+
+            loc0 = a.get_location()
+            vel = a.get_velocity()
+            vx, vy = float(vel.x), float(vel.y)
+            v = float(math.hypot(vx, vy))
+
+            bb = getattr(a, "bounding_box", None)
+            half_w = float(getattr(getattr(bb, "extent", None), "y", 0.4))
+
+            lat_radius = half_w + (veh_lat_buffer if is_vehicle else ped_lat_buffer)
+
+            if v < static_v_thresh:
+                tf = a.get_transform()
+                fwd = tf.get_forward_vector()
+                vx, vy = float(fwd.x) * 0.5, float(fwd.y) * 0.5
+
+            for tt in np.arange(0.0, float(T_pred) + 1e-6, float(dt_pred)):
+                px = float(loc0.x + vx * tt)
+                py = float(loc0.y + vy * tt)
+                s_p, ey_p = self.ref.xy2se(px, py, max_proj_dist=None)
+                if s_p is None:
+                    continue
+                add_block_at_s(s_p, ey_p, lat_radius)
+
+        for i in range(len(blocked)):
+            blocked[i] = self._merge_intervals(blocked[i])
+        return blocked
+
+    def update_corridor(self, world: carla.World, ego: carla.Actor, s_ahead: float = 35.0, ds: float = 1.0, debug_draw: bool = True):
+        if ego is None:
             self.corridor = None
             return
 
-        s_nodes, left_ey, right_ey, up_pts, lo_pts = build_corridor_by_cones_one_side_only(
-            world=world,
-            ego=ego,
-            ref=self.ref,
-            s_ahead=s_ahead,
-            ds=ds,
-            lane_margin=0.20,
-            cone_margin=0.30,
+        ok = self.rebuild_ref_from_ego(ego, step=1.0, max_len=240.0)
+        if not ok:
+            self.corridor = None
+            self._dp_dbg = {"dp_ok": False, "reason": "ref_build_failed"}
+            return
+
+        ego_width = float(ego.bounding_box.extent.y * 2.0)
+        required_width = ego_width + 0.40
+
+        out = build_corridor_by_cones_one_side_only(
+            world=world, ego=ego, ref=self.ref,
+            s_ahead=s_ahead, ds=ds,
+            lane_margin=self.LANE_MARGIN,
+            cone_margin=self.CONE_MARGIN,
             min_width=1.8,
-            force_normal_coord=force_normal_coord
+            cone_extra_clearance=self.CONE_EXTRA_CLEAR,
+            expand_adjacent=False,
+            required_width=required_width,
         )
 
-        # 中心线 = 左右边界中点（物理左右）
-        center_ey = 0.5 * (left_ey + right_ey)
+        if out is not None:
+            min_w = float(out.get("min_width_safe", 999.0))
+            if min_w < required_width:
+                print(f"[Corridor] single-lane too narrow: min_w={min_w:.2f} < req={required_width:.2f}, expand to adjacent")
+                out2 = build_corridor_by_cones_one_side_only(
+                    world=world, ego=ego, ref=self.ref,
+                    s_ahead=s_ahead, ds=ds,
+                    lane_margin=self.LANE_MARGIN,
+                    cone_margin=self.CONE_MARGIN,
+                    min_width=1.8,
+                    cone_extra_clearance=self.CONE_EXTRA_CLEAR,
+                    expand_adjacent=True,
+                    required_width=required_width,
+                )
+                if out2 is not None:
+                    out = out2
+
+        if out is None:
+            self.corridor = None
+            self._dp_dbg = {"dp_ok": False, "reason": "corridor_build_failed"}
+            return
+
+        s_nodes = out["s_nodes"]
+        bound_upper_safe = out["bound_upper_safe"]
+        bound_lower_safe = out["bound_lower_safe"]
+
+        # ✅ 动态障碍物预测 tube -> blocked_intervals
+        blocked = None
+        if self.ENABLE_DYNAMIC_BLOCK:
+            blocked = self._predict_blocked_intervals(world, ego, s_nodes)
+
+        if self.DP_ENABLE:
+            ey_ref, dp_dbg = dp_plan_centerline(
+                world=world, ego=ego, ref=self.ref,
+                s_nodes=s_nodes,
+                bound_upper=bound_upper_safe,
+                bound_lower=bound_lower_safe,
+                ey_range=self.DP_EY_RANGE,
+                dey=self.DP_DEY,
+                corridor_margin=self.DP_CORRIDOR_MARGIN,
+                W_CENTER=self.DP_W_CENTER,
+                W_SMOOTH=self.DP_W_SMOOTH,
+                fallback_to_mid=True,
+                blocked_intervals=blocked,
+            )
+            center_ey = ey_ref
+            self._dp_dbg = dp_dbg
+        else:
+            center_ey = 0.5 * (bound_upper_safe + bound_lower_safe)
+            self._dp_dbg = {"dp_ok": False, "reason": "DP disabled"}
+
         self.corridor = SimpleNamespace(
             s=s_nodes,
-            upper=left_ey,  # 物理左
-            lower=right_ey,  # 物理右
-            upper_pts_world=up_pts,
-            lower_pts_world=lo_pts,
+            left_phys=out["left_phys"],
+            right_phys=out["right_phys"],
+            bound_upper=out["bound_upper"],
+            bound_lower=out["bound_lower"],
+            bound_upper_safe=bound_upper_safe,
+            bound_lower_safe=bound_lower_safe,
+            upper_pts_world=out["upper_pts_world"],
+            lower_pts_world=out["lower_pts_world"],
             center_path_ey=center_ey,
         )
 
-        # 可视化：只画线
         if debug_draw and self.corridor:
+            now = world.get_snapshot().timestamp.elapsed_seconds
+            if now - self._last_draw_t < self.DRAW_PERIOD:
+                return
+            self._last_draw_t = now
+
             dbg = world.debug
             z0 = ego.get_location().z + 0.35
 
-            # 参考线
             if self.DRAW_REF_LINE:
                 step_idx = max(1, int(3.0 / max(1e-6, self.ref.step)))
                 for p0, p1 in zip(self.ref.P[:-1:step_idx], self.ref.P[1::step_idx]):
-                    dbg.draw_line(
-                        carla.Location(p0[0], p0[1], z0),
-                        carla.Location(p1[0], p1[1], z0),
-                        thickness=0.06, color=COL_REF, life_time=self.DEBUG_LIFE_TIME
-                    )
+                    dbg.draw_line(carla.Location(p0[0], p0[1], z0),
+                                  carla.Location(p1[0], p1[1], z0),
+                                  thickness=0.06, color=COL_REF, life_time=self.DEBUG_LIFE_TIME)
 
-            # 左右边界（物理左=洋红，物理右=绿）
             if self.DRAW_CORRIDOR_EDGES:
-                up_pts = self.corridor.upper_pts_world  # 物理左
-                lo_pts = self.corridor.lower_pts_world  # 物理右
+                up_pts = self.corridor.upper_pts_world
+                lo_pts = self.corridor.lower_pts_world
                 for i in range(0, len(up_pts) - 1):
-                    dbg.draw_line(
-                        carla.Location(up_pts[i].x, up_pts[i].y, z0),
-                        carla.Location(up_pts[i + 1].x, up_pts[i + 1].y, z0),
-                        thickness=0.12, color=COL_LEFT, life_time=self.DEBUG_LIFE_TIME
-                    )
-                    dbg.draw_line(
-                        carla.Location(lo_pts[i].x, lo_pts[i].y, z0),
-                        carla.Location(lo_pts[i + 1].x, lo_pts[i + 1].y, z0),
-                        thickness=0.12, color=COL_RIGHT, life_time=self.DEBUG_LIFE_TIME
-                    )
+                    # 注释掉紫色左边界线（COL_LEFT）
+                    # dbg.draw_line(carla.Location(up_pts[i].x, up_pts[i].y, z0),
+                    #               carla.Location(up_pts[i + 1].x, up_pts[i + 1].y, z0),
+                    #               thickness=0.12, color=COL_LEFT, life_time=self.DEBUG_LIFE_TIME)
+                    # 注释掉绿色右边界线（COL_RIGHT）
+                    # dbg.draw_line(carla.Location(lo_pts[i].x, lo_pts[i].y, z0),
+                    #               carla.Location(lo_pts[i + 1].x, lo_pts[i + 1].y, z0),
+                    #               thickness=0.12, color=COL_RIGHT, life_time=self.DEBUG_LIFE_TIME)
+                    pass
 
-            # 中心线（取左右中点）
             if self.DRAW_DP_CENTER:
-                center_pts = []
+                dp_pts = []
                 for s_val, ey_c in zip(self.corridor.s, self.corridor.center_path_ey):
-                    cx, cy = self.ref.se2xy(s_val, ey_c)
-                    center_pts.append(carla.Location(cx, cy, z0))
-                for p0, p1 in zip(center_pts[:-1], center_pts[1:]):
-                    dbg.draw_line(p0, p1, thickness=0.08, color=COL_CENTER, life_time=self.DEBUG_LIFE_TIME)
+                    cx, cy = self.ref.se2xy(s_val, float(ey_c))
+                    dp_pts.append(carla.Location(cx, cy, z0))
+                for p0, p1 in zip(dp_pts[:-1], dp_pts[1:]):
+                    dbg.draw_line(p0, p1, thickness=0.10, color=COL_DP, life_time=self.DEBUG_LIFE_TIME)
 
-    def vehicle_model_frenet(self, x, u, L=2.5):
-        """
-        Frenet坐标系下的车辆动力学模型.
-        x: [vx, ey, yaw_err, s]
-        u: [accel, delta]
-        """
+    def vehicle_model_frenet(self, x, u):
         vx, ey, yaw_err, s = x
         accel, delta = u
-        ey_dot = vx * math.sin(yaw_err)
-        yaw_err_dot = vx * math.tan(delta) / L
-        vx_dot = accel
         s_dot = vx * math.cos(yaw_err)
-        return np.array([vx_dot, ey_dot, yaw_err_dot, s_dot])
+        k_ref = float(self.ref.kappa_at_s(float(s))) if self.ref is not None else 0.0
+        ey_dot = vx * math.sin(yaw_err)
+        yaw_err_dot = vx * math.tan(delta) / max(1e-6, self.WHEELBASE) - k_ref * s_dot
+        vx_dot = accel
+        return np.array([vx_dot, ey_dot, yaw_err_dot, s_dot], dtype=float)
 
-    def compute_control(self, ego: carla.Actor, dt: float = 0.05):
-        """
-        横向：MPC控制，追踪动态的走廊中线
-        纵向：简单的P控制器，以基础参考速度为目标
-        """
+    def compute_control(self, ego: carla.Actor, dt: float = 0.05) -> Tuple[float, float, float, Dict[str, Any]]:
         tf = ego.get_transform()
         vel = ego.get_velocity()
         speed = float(math.hypot(vel.x, vel.y))
-        x, y = tf.location.x, tf.location.y
 
-        if self.corridor is None or len(self.corridor.s) < 3:
-            return 0.0, 0.0, 1.0, {}  # 紧急刹车
+        if self.corridor is None or self.ref is None or len(self.corridor.s) < 3:
+            return 0.0, 0.0, 0.4, {"opt_ok": False, "reason": "no_corridor"}
 
-        H = 10  # 预测时域
-        L = ego.bounding_box.extent.x * 2.0
+        self._ensure_vehicle_params(ego)
+        delta_max = float(self._max_steer_rad)
+        delta_min = -delta_max
 
-        s_now, ey_now = self.ref.xy2se(x, y)
+        ego_wp = self.amap.get_waypoint(tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+        lane_w = float(getattr(ego_wp, "lane_width", 3.5)) if ego_wp is not None else 3.5
+        max_proj_dist = 1.2 * lane_w + 1.0
+
+        s_now, ey_now = self.ref.xy2se(tf.location.x, tf.location.y, max_proj_dist=max_proj_dist)
+        if s_now is None:
+            # ✅ 不要 break 主循环：给一个可恢复的 fail，让外层继续 tick
+            return 0.0, 0.0, 0.6, {"opt_ok": False, "reason": "ego_out_of_ref", "opt_msg": "projection_fail"}
+
         ego_yaw_rad = math.radians(tf.rotation.yaw)
-
-        # 更精确的航向角误差
-        s_idx = np.searchsorted(self.ref.s, s_now)
-        s_idx = min(s_idx, len(self.ref.tang) - 1)
+        s_idx = int(np.searchsorted(self.ref.s, s_now))
+        s_idx = min(max(s_idx, 0), len(self.ref.tang) - 1)
         ref_yaw_rad = math.atan2(self.ref.tang[s_idx, 1], self.ref.tang[s_idx, 0])
         yaw_err_now = ego_yaw_rad - ref_yaw_rad
-        # Normalize error to [-pi, pi]
         yaw_err_now = (yaw_err_now + np.pi) % (2 * np.pi) - np.pi
 
-        x0 = np.array([speed, ey_now, yaw_err_now, s_now])
+        x0 = np.array([speed, ey_now, yaw_err_now, s_now], dtype=float)
 
-        def objective_function(u):
-            u = u.reshape((H, 2))
-            W_CONTROL = 0.1
-            W_CONTROL_RATE = 0.1
-            W_EY = 10.0
-            W_SPEED = 0.5
+        H = 12
+        accel_min, accel_max = -5.0, 3.0
 
-            cost_control = np.sum(u[:, 0] ** 2) + np.sum(u[:, 1] ** 2)
-            cost_control_rate = np.sum(np.diff(u[:, 0]) ** 2) + np.sum(np.diff(u[:, 1]) ** 2)
+        W_EY_TRACK = 8.0
+        W_YAW_TRACK = 10.0
+        W_SPEED = 0.5
+        W_U = 0.10
+        W_DU = 0.20
+        W_BOUND = 1500.0
+        W_STEER_RATE = 12.0
+        W_LAT = 0.06
 
-            x_pred = x0.copy()
-            cost_ey_tracking = 0.0
-            cost_speed_tracking = 0.0
+        def get_bounds_at_s(s):
+            up = float(np.interp(s, self.corridor.s, self.corridor.bound_upper_safe))
+            lo = float(np.interp(s, self.corridor.s, self.corridor.bound_lower_safe))
+            if up < lo:
+                mid = 0.5 * (up + lo)
+                up = mid + 0.05
+                lo = mid - 0.05
+            return up, lo
+
+        def ey_target_at_s(s):
+            return float(np.interp(s, self.corridor.s, self.corridor.center_path_ey))
+
+        up_now, lo_now = get_bounds_at_s(s_now)
+        width_now = float(up_now - lo_now)
+
+        v_ref = float(self.v_ref_base)
+        if width_now < 2.6:
+            v_ref = min(v_ref, 5.0)
+        elif width_now < 3.2:
+            v_ref = min(v_ref, 7.0)
+        elif width_now < 4.0:
+            v_ref = min(v_ref, 9.0)
+
+        if self._u_prev is None or np.shape(self._u_prev) != (H, 2):
+            u0 = np.zeros((H, 2), dtype=float)
+        else:
+            u0 = np.vstack([self._u_prev[1:], self._u_prev[-1:]]).copy()
+
+        u0_flat = u0.reshape(-1)
+
+        def relu(z):
+            return z if z > 0.0 else 0.0
+
+        SUB = 3
+        h = float(dt) / float(SUB)
+
+        def objective(u_flat):
+            u = u_flat.reshape((H, 2))
+            cost_u = W_U * (np.sum(u[:, 0] ** 2) + np.sum(u[:, 1] ** 2))
+            cost_du = W_DU * (np.sum(np.diff(u[:, 0]) ** 2) + np.sum(np.diff(u[:, 1]) ** 2))
+
+            x = x0.copy()
+            cost_track = 0.0
+            cost_bound = 0.0
+            cost_steer_rate = 0.0
+            cost_lat = 0.0
+
+            prev_delta = float(u0[0, 1])
 
             for k in range(H):
-                x_pred += self.vehicle_model_frenet(x_pred, u[k], L) * dt
+                accel = float(u[k, 0])
+                delta = float(u[k, 1])
 
-                s_pred = x_pred[3]
-                ey_target = np.interp(s_pred, self.corridor.s, self.corridor.center_path_ey)
-                ey_error = x_pred[1] - ey_target
-                cost_ey_tracking += ey_error ** 2
+                ddelta = delta - prev_delta
+                cost_steer_rate += W_STEER_RATE * (ddelta ** 2)
+                prev_delta = delta
 
-                speed_error = self.v_ref_base - x_pred[0]
-                cost_speed_tracking += speed_error ** 2
+                for _ in range(SUB):
+                    x = x + self.vehicle_model_frenet(x, [accel, delta]) * h
 
-            total_cost = (cost_control * W_CONTROL +
-                          cost_control_rate * W_CONTROL_RATE +
-                          cost_ey_tracking * W_EY +
-                          cost_speed_tracking * W_SPEED)
-            return total_cost
+                vx_k, ey_k, yaw_k, s_k = float(x[0]), float(x[1]), float(x[2]), float(x[3])
 
-        cons = []
+                ey_t = ey_target_at_s(s_k)
+                cost_track += W_EY_TRACK * ((ey_k - ey_t) ** 2)
+                cost_track += W_YAW_TRACK * (yaw_k ** 2)
+                cost_track += W_SPEED * ((vx_k - v_ref) ** 2)
 
-        def get_bounds_at_s(s, corridor):
-            upper = np.interp(s, corridor.s, corridor.upper)
-            lower = np.interp(s, corridor.s, corridor.lower)
-            return upper, lower
+                up, lo = get_bounds_at_s(s_k)
+                v_up = relu(ey_k - up)
+                v_lo = relu(lo - ey_k)
+                cost_bound += W_BOUND * (v_up * v_up + v_lo * v_lo)
 
-        for k in range(H):
-            def upper_constraint(u, k=k):
-                u = u.reshape((H, 2))
-                x_pred = x0.copy()
-                for i in range(k + 1):
-                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
-                s_pred, ey_pred = x_pred[3], x_pred[1]
-                upper, _ = get_bounds_at_s(s_pred, self.corridor)
-                return upper - ey_pred
+                kappa = math.tan(delta) / max(1e-6, self.WHEELBASE)
+                a_lat = (vx_k * vx_k) * kappa
+                cost_lat += W_LAT * (a_lat * a_lat)
 
-            def lower_constraint(u, k=k):
-                u = u.reshape((H, 2))
-                x_pred = x0.copy()
-                for i in range(k + 1):
-                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
-                s_pred, ey_pred = x_pred[3], x_pred[1]
-                _, lower = get_bounds_at_s(s_pred, self.corridor)
-                return ey_pred - lower
+            return cost_u + cost_du + cost_track + cost_bound + cost_steer_rate + cost_lat
 
-            cons.append({'type': 'ineq', 'fun': upper_constraint})
-            cons.append({'type': 'ineq', 'fun': lower_constraint})
-
-        accel_min, accel_max = -5.0, 3.0
-        delta_min, delta_max = -math.radians(30), math.radians(30)
         bounds = [(accel_min, accel_max), (delta_min, delta_max)] * H
 
-        u_initial_guess = np.zeros(2 * H)
-        result = minimize(objective_function, u_initial_guess, bounds=bounds, constraints=cons, method='SLSQP')
+        res = minimize(
+            objective,
+            u0_flat,
+            bounds=bounds,
+            method="SLSQP",
+            options={"maxiter": 70, "ftol": 1e-3, "disp": False}
+        )
 
-        optimal_u = result.x.reshape((H, 2))
-        optimal_accel = optimal_u[0, 0]
-        optimal_delta = optimal_u[0, 1]
+        if (not getattr(res, "success", False)) or (res.x is None) or (not np.all(np.isfinite(res.x))):
+            dbg = {
+                "s": float(s_now), "ey": float(ey_now),
+                "v": float(speed), "v_ref": float(v_ref),
+                "lo": float(lo_now), "up": float(up_now),
+                "width": float(width_now),
+                "dp_ok": bool(self._dp_dbg.get("dp_ok", False)),
+                "opt_ok": False,
+                "reason": "opt_fail",
+                "opt_msg": str(getattr(res, "message", "fail")),
+            }
+            return 0.0, 0.0, 0.4, dbg
 
-        if optimal_accel > 0:
-            throttle = float(np.clip(optimal_accel / accel_max, 0, 1))
+        u_opt = res.x.reshape((H, 2))
+        self._u_prev = u_opt.copy()
+
+        accel0 = float(u_opt[0, 0])
+        delta0 = float(u_opt[0, 1])
+
+        if accel0 >= 0:
+            throttle = float(np.clip(accel0 / accel_max, 0, 1))
             brake = 0.0
         else:
             throttle = 0.0
-            brake = float(np.clip(optimal_accel / accel_min, 0, 1))
+            brake = float(np.clip((-accel0) / (-accel_min), 0, 1))
 
-        steer = float(np.clip(optimal_delta / delta_max, -1, 1))
+        raw_steer = float(np.clip(delta0 / delta_max, -1, 1))
 
-        s_idx = np.argmin(np.abs(self.corridor.s - s_now))
-        dbg_info = {
-            's': s_now, 'ey': ey_now,
-            'lo': self.corridor.lower[s_idx], 'up': self.corridor.upper[s_idx],
-            'width': abs(self.corridor.upper[s_idx] - self.corridor.lower[s_idx]),
-            'v': speed, 'v_ref': self.v_ref_base,
-            'delta': optimal_delta, 'steer': steer,
-            'throttle': throttle, 'brake': brake
+        max_step = 0.12
+        raw_steer = float(np.clip(raw_steer, self._steer_prev - max_step, self._steer_prev + max_step))
+        alpha = 0.55
+        steer = float(alpha * raw_steer + (1.0 - alpha) * self._steer_prev)
+        self._steer_prev = steer
+
+        dbg = {
+            "s": float(s_now), "ey": float(ey_now),
+            "lo": float(lo_now), "up": float(up_now),
+            "width": float(width_now),
+            "v": float(speed), "v_ref": float(v_ref),
+            "delta": float(delta0), "steer": float(steer),
+            "throttle": float(throttle), "brake": float(brake),
+            "dp_ok": bool(self._dp_dbg.get("dp_ok", False)),
+            "opt_ok": True,
+            "opt_msg": "ok"
         }
-        return throttle, steer, brake, dbg_info
+        return throttle, steer, brake, dbg
 
 
-def set_spectator_above_start_point(
-        world: carla.World,
-        start_transform: carla.Transform,
-        height: float = 35.0,
-        distance_behind: float = 30.0,
-        pitch: float = -45.0
-):
-    spectator = world.get_spectator()
-    forward_vector = start_transform.get_forward_vector()
-    camera_location = (
-            start_transform.location
-            - forward_vector * distance_behind
-            + carla.Location(z=height)
-    )
-    camera_rotation = carla.Rotation(
-        pitch=pitch,
-        yaw=start_transform.rotation.yaw,
-        roll=0.0
-    )
-    final_transform = carla.Transform(camera_location, camera_rotation)
-    spectator.set_transform(final_transform)
-    print(f"[Spectator] 观察者视角已固定在 {camera_location}")
+# ============================================================
+# 8) main：跑起来 - 支持多场景选择
+# ============================================================
+def main(scenario_type: str = "jaywalker"):
+    print(f"\n{'='*60}")
+    print("  Rule-Based Planner 场景测试")
+    print(f"  场景类型: {scenario_type}")
+    print(f"{'='*60}\n")
 
+    client = carla.Client("127.0.0.1", 2000)
+    client.set_timeout(10.0)
+    world = client.get_world()
+    amap = world.get_map()
 
-# ====== 6) 主程序 ======
-def main():
-    FORCE_COORDINATE_SYSTEM_NORMAL = False  # 如果发现方向反了，可以改成False或True来手动校正
+    # TrafficFlowSpawner 保留
+    traffic_flow_spawner = TrafficFlowSpawner(client, world, 8000)
 
-    env = HighwayEnv(host="127.0.0.1", port=2000, sync=True, fixed_dt=0.05).connect()
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.05
+    world.apply_settings(settings)
+
+    env = None
     logger = None
+    scenario = None
+    ego = None
+
     try:
-        env.setup_scene(
-            num_cones=5, step_forward=3.0, step_right=0.35,
-            z_offset=0.0, min_gap_from_junction=15.0,
-            grid=5.0, set_spectator=True
-        )
+        if scenario_type == "cones":
+            print("[场景] 使用原有锥桶场景")
+            env = HighwayEnv(host="127.0.0.1", port=2000, sync=True, fixed_dt=0.05).connect()
+            env.setup_scene(
+                num_cones=5, step_forward=3.0, step_right=0.35,
+                z_offset=0.0, min_gap_from_junction=15.0,
+                grid=5.0, set_spectator=True
+            )
+            ego, ego_wp = spawn_ego_upstream_lane_center(env)
 
-        ego, ego_wp = spawn_ego_upstream_lane_center(env)
-        if ego_wp is None:
-            raise RuntimeError("无法为已生成的Ego车辆找到有效的路点。")
-        set_spectator_above_start_point(env.world, ego_wp.transform)
+        elif scenario_type == "jaywalker":
+            print("[场景] 初始化鬼探头场景（行人突然横穿）")
+            config = SimpleNamespace(
+                jaywalker_distance=25.0,
+                jaywalker_speed=2.5,
+                jaywalker_trigger_distance=18.0,
+                jaywalker_start_side="random",
+                use_occlusion_vehicle=False,
+                tm_port=8000,
+                enable_traffic_flow=True,
+            )
+            scenario = JaywalkerScenario(world, amap, config)
+            if not scenario.setup():
+                raise RuntimeError("鬼探头场景初始化失败")
+            ego, ego_wp = spawn_ego_from_scenario(world, scenario, env=None)
 
-        print(f"[参考线生成] 使用自车所在位置的路点 {ego_wp.transform.location} 作为参考线起点。")
-        amap = env.world.get_map()
-        ref = LaneRef(amap, seed_wp=ego_wp, step=1.0, max_len=500.0)
+        elif scenario_type == "trimma":
+            print("[场景] 初始化 Trimma 场景（左右夹击 + 前车）")
+            config = SimpleNamespace(
+                front_vehicle_distance=18.0,
+                side_vehicle_offset=3.0,
+                min_lane_count=3,
+                tm_port=8000,
+                tm_global_distance=2.5,
+                front_speed_diff_pct=70.0,
+                side_speed_diff_pct=80.0,
+                disable_lane_change=True,
+                enable_traffic_flow=True,
+            )
+            scenario = TrimmaScenario(world, amap, config)
+            if not scenario.setup():
+                raise RuntimeError("Trimma场景初始化失败")
+            ego, ego_wp = spawn_ego_from_scenario(world, scenario, env=None)
 
-        idp = 0.0
-        scenemanager = SceneManager(ego_wp, idp)
-        scenemanager.gen_traffic_flow(env.world, ego_wp)
+        elif scenario_type == "construction":
+            print("[场景] 初始化施工封道 + 高密度交通流变道场景")
+            config = SimpleNamespace(
+                construction_distance=30.0,
+                construction_length=20.0,
+                traffic_density=3.0,
+                traffic_speed=8.0,
+                min_gap_for_lane_change=12.0,
+                construction_type="construction1",
+                flow_range=80.0,
+                tm_port=8000,
+                enable_traffic_flow=True,
+            )
+            scenario = ConstructionLaneChangeScenario(world, amap, config)
+            if not scenario.setup():
+                raise RuntimeError("施工场景初始化失败")
+            ego, ego_wp = spawn_ego_from_scenario(world, scenario, env=None)
 
-        planner = RuleBasedPlanner(ref, v_ref_base=12.0)
-        logger = TelemetryLogger(out_dir="logs_rule_based")
+        else:
+            raise ValueError(f"未知场景类型: {scenario_type}")
+
+        planner = RuleBasedPlanner(amap, v_ref_base=12.0)
+        logger = TelemetryLogger(out_dir=f"logs_rule_based_{scenario_type}")
 
         dt = 0.05
         frame = 0
 
-        while True:
-            # 1) 更新走廊
-            planner.update_corridor_simplified(env.world, ego, force_normal_coord=FORCE_COORDINATE_SYSTEM_NORMAL)
+        print("\n[开始] 场景运行中... (按 Ctrl+C 停止)\n")
 
-            # 2) 控制
+        while True:
+            spectator_follow_ego(world, ego)
+
+            planner.update_corridor(world, ego, s_ahead=35.0, ds=1.0, debug_draw=True)
             throttle, steer, brake, dbg = planner.compute_control(ego, dt=dt)
 
-            # 3) 执行
-            env.apply_control(throttle=throttle, steer=steer, brake=brake)
+            ctrl = carla.VehicleControl()
+            ctrl.throttle = float(throttle)
+            ctrl.steer = float(steer)
+            ctrl.brake = float(brake)
+            ego.apply_control(ctrl)
 
-            # 4) 仿真步进 & 可视化
-            obs, _ = env.step()
-            if frame % 2 == 0:
-                tf = ego.get_transform()
-                # draw_ego_marker(env.world, tf.location.x, tf.location.y)
+            world.tick()
 
-            # 5) 打印 & 记录
+            if scenario_type == "jaywalker" and scenario is not None:
+                ego_loc = ego.get_location()
+                scenario.check_and_trigger(ego_loc)
+                scenario.tick_update()
+
+            obs = None
+            if env is not None:
+                # ⚠️ 注意：如果你的 env.step 内部也 tick，那会双 tick。
+                # 你 cones 场景之前能跑，说明你 env.step 很可能只是取观测/更新缓存。
+                obs, _ = env.step()
+
             if dbg and frame % 10 == 0:
-                print(f"[CTRL] s={dbg['s']:.1f} ey={dbg['ey']:.2f} | lo={dbg['lo']:.2f} up={dbg['up']:.2f} "
-                      f"w={dbg['width']:.2f} | v={dbg['v']:.2f}->{dbg['v_ref']:.2f} "
-                      f"| delta={dbg['delta']:.3f} steer={dbg['steer']:.2f}")
-                print(f"[LONG] th={dbg['throttle']:.2f} br={dbg['brake']:.2f}")
+                if dbg.get("opt_ok", False):
+                    print(f"[CTRL] s={dbg['s']:.1f} ey={dbg['ey']:.2f} | lo={dbg['lo']:.2f} up={dbg['up']:.2f} "
+                          f"w={dbg['width']:.2f} | v={dbg['v']:.2f}->{dbg['v_ref']:.2f} "
+                          f"| delta={dbg.get('delta', 0.0):.3f} steer={dbg.get('steer', 0.0):.2f} "
+                          f"| dp_ok={dbg.get('dp_ok', False)} opt_ok=True | msg={dbg.get('opt_msg','')}")
+                else:
+                    print(f"[CTRL-FAIL] reason={dbg.get('reason','')} msg={dbg.get('opt_msg','')}")
 
-            logger.log(frame, obs, dbg, ref)
+            logger.log(frame, obs, dbg, planner.ref if planner.ref is not None else None)
             frame += 1
 
     except KeyboardInterrupt:
         print("\n[Stop] 手动退出。")
+
     finally:
+        print("\n[清理] 正在清理场景...")
         try:
             if logger is not None:
                 logger.save_csv()
                 logger.plot()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[清理] Logger 保存失败: {e}")
+
         try:
-            env.close()
-        except Exception:
-            pass
+            if scenario is not None:
+                scenario.cleanup()
+                print("[清理] 场景清理完成")
+        except Exception as e:
+            print(f"[清理] 场景清理失败: {e}")
+
+        try:
+            if ego is not None:
+                ego.destroy()
+                print("[清理] Ego 车辆销毁完成")
+        except Exception as e:
+            print(f"[清理] Ego 销毁失败: {e}")
+
+        try:
+            if env is not None:
+                env.close()
+        except Exception as e:
+            print(f"[清理] Env 关闭失败: {e}")
+
+        try:
+            settings = world.get_settings()
+            settings.synchronous_mode = False
+            world.apply_settings(settings)
+            print("[清理] 已恢复异步模式")
+        except Exception as e:
+            print(f"[清理] 恢复异步模式失败: {e}")
+
+        print("[清理] 清理完成\n")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Rule-Based Planner 多场景测试")
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="jaywalker",
+        choices=["cones", "jaywalker", "trimma", "construction"],
+        help="场景类型: cones(锥桶), jaywalker(鬼探头), trimma(左右夹击), construction(施工变道)"
+    )
+    args = parser.parse_args()
+    main(scenario_type=args.scenario)

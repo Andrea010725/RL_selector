@@ -297,11 +297,35 @@ class TelemetryLogger:
         os.makedirs(out_dir, exist_ok=True)
 
     def log(self, frame: int, obs: Dict[str, Any], dbg: Dict[str, Any], ref) -> None:
-        x = float(obs["ego_pose"]["x"]); y = float(obs["ego_pose"]["y"])
-        s_now, ey_now = ref.xy2se(x, y)
+        """
+        记录一帧数据
+
+        Args:
+            frame: 帧号
+            obs: 观测数据（可能为 None，jaywalker等场景没有 env）
+            dbg: 调试信息（来自 planner）
+            ref: 参考线对象（可能为 None）
+        """
+        # ✅ 修复：处理 obs 为 None 的情况（jaywalker 等场景没有 env）
+        if obs is not None and "ego_pose" in obs:
+            x = float(obs["ego_pose"]["x"])
+            y = float(obs["ego_pose"]["y"])
+        else:
+            # 从 dbg 中获取 s 和 ey（planner 已经计算过）
+            x = None
+            y = None
+
+        # ✅ 修复：处理 ref 为 None 的情况
+        if ref is not None and x is not None and y is not None:
+            s_now, ey_now = ref.xy2se(x, y)
+        else:
+            # 从 dbg 中获取（planner 已经计算过）
+            s_now = float(dbg.get("s", float("nan")))
+            ey_now = float(dbg.get("ey", float("nan")))
+
         self.data["t"].append(frame)
-        self.data["s"].append(s_now)
-        self.data["ey"].append(ey_now)
+        self.data["s"].append(s_now if s_now is not None else float("nan"))
+        self.data["ey"].append(ey_now if ey_now is not None else float("nan"))
         self.data["lo"].append(float(dbg.get("lo", float("nan"))))
         self.data["up"].append(float(dbg.get("up", float("nan"))))
         self.data["v"].append(float(dbg.get("v", float("nan"))))
