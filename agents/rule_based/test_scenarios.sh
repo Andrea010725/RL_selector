@@ -62,7 +62,7 @@ for scenario in "${scenarios[@]}"; do
     echo ""
 
     # 运行测试
-    python rule_based_agent.py --scenario "$scenario"
+    python rule_based_agent_0203.py --scenario "$scenario"
 
     exit_code=$?
 

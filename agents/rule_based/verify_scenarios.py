@@ -43,7 +43,7 @@ def verify_imports():
 
     print("\n[3/5] 验证 rule_based_agent 导入...")
     try:
-        from agents.rule_based.rule_based_agent import (
+        from agents.rule_based.rule_based_agent_0203 import (
             spawn_ego_from_scenario,
             spawn_ego_upstream_lane_center,
             RuleBasedPlanner,
@@ -136,7 +136,7 @@ def verify_files():
 
     files_to_check = [
         ("/home/ajifang/RL_selector/env/scenarios.py", "场景定义文件"),
-        ("/home/ajifang/RL_selector/agents/rule_based/rule_based_agent.py", "Rule-based planner"),
+        ("/home/ajifang/RL_selector/agents/rule_based/rule_based_agent_0203.py", "Rule-based planner"),
         ("/home/ajifang/RL_selector/agents/rule_based/test_scenarios.sh", "测试脚本"),
         ("/home/ajifang/RL_selector/agents/rule_based/README_SCENARIOS.md", "场景文档"),
         ("/home/ajifang/RL_selector/agents/rule_based/QUICKSTART.md", "快速开始指南"),
@@ -174,13 +174,13 @@ def print_usage_guide():
 
     print("  3. 运行场景测试:")
     print("     # 测试鬼探头场景")
-    print("     python rule_based_agent.py --scenario jaywalker\n")
+    print("     python rule_based_agent_0203.py --scenario jaywalker\n")
 
     print("     # 测试 Trimma 场景")
-    print("     python rule_based_agent.py --scenario trimma\n")
+    print("     python rule_based_agent_0203.py --scenario trimma\n")
 
     print("     # 测试施工变道场景")
-    print("     python rule_based_agent.py --scenario construction\n")
+    print("     python rule_based_agent_0203.py --scenario construction\n")
 
     print("     # 或使用自动化脚本测试所有场景")
     print("     ./test_scenarios.sh\n")

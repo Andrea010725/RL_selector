@@ -15,9 +15,10 @@ import argparse
 import pickle
 import json
 import sys
-# sys.path.append("/home/ajifang/SAC_carla/carla_base/")
+#sys.path.append("/home/ajifang/SAC_carla/carla_base/")
+sys.path.append("/home/ajifang/RL_selector/env")
 from tiny_scenarios import VEHICLE_TYPE_DICT, TYPE_VEHICLE_DICT, choose_bp_name
-# from carla_data_provider import CarlaDataProvider
+from carla_data_provider import CarlaDataProvider
 
 
 from functools import reduce

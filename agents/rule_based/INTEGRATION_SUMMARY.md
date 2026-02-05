@@ -138,16 +138,16 @@ env/
 cd /home/ajifang/RL_selector/agents/rule_based
 
 # 测试鬼探头场景
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 
 # 测试 Trimma 场景
-python rule_based_agent.py --scenario trimma
+python rule_based_agent_0203.py --scenario trimma
 
 # 测试施工变道场景
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario construction
 
 # 测试原有锥桶场景
-python rule_based_agent.py --scenario cones
+python rule_based_agent_0203.py --scenario cones
 ```
 
 ### 方法2: 使用自动化脚本
@@ -172,8 +172,9 @@ python batch_test_scenarios.py --duration 120 --scenarios cones jaywalker trimma
 ```
 
 ### 方法4: Python 代码调用
+
 ```python
-from agents.rule_based.rule_based_agent import main
+from agents.rule_based.rule_based_agent_0203 import main
 
 # 运行指定场景
 main(scenario_type="jaywalker")
@@ -205,7 +206,7 @@ python verify_scenarios.py
 ```bash
 # 确保 CARLA 已启动
 cd /home/ajifang/RL_selector/agents/rule_based
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 ```
 
 **预期行为**:
@@ -433,7 +434,7 @@ cd /home/ajifang/RL_selector/agents/rule_based
 python verify_scenarios.py
 
 # 3. 测试场景
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 
 # 4. 查看日志
 cd logs_rule_based_jaywalker/

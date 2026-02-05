@@ -16,7 +16,7 @@
 
 **运行命令**:
 ```bash
-python rule_based_agent.py --scenario cones
+python rule_based_agent_0203.py --scenario cones
 # 或
 ./test_scenarios.sh cones
 ```
@@ -40,7 +40,7 @@ python rule_based_agent.py --scenario cones
 
 **运行命令**:
 ```bash
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 # 或
 ./test_scenarios.sh jaywalker
 ```
@@ -68,7 +68,7 @@ python rule_based_agent.py --scenario jaywalker
 
 **运行命令**:
 ```bash
-python rule_based_agent.py --scenario trimma
+python rule_based_agent_0203.py --scenario trimma
 # 或
 ./test_scenarios.sh trimma
 ```
@@ -96,7 +96,7 @@ python rule_based_agent.py --scenario trimma
 
 **运行命令**:
 ```bash
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario construction
 # 或
 ./test_scenarios.sh construction
 ```
@@ -110,7 +110,7 @@ python rule_based_agent.py --scenario construction
 ### 方法1: 直接运行单个场景
 ```bash
 cd /home/ajifang/RL_selector/agents/rule_based
-python rule_based_agent.py --scenario <场景名称>
+python rule_based_agent_0203.py --scenario <场景名称>
 ```
 
 场景名称可选:

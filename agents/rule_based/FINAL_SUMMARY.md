@@ -87,16 +87,16 @@ cd /home/ajifang/RL_selector/agents/rule_based
 
 ```bash
 # 测试鬼探头场景
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 
 # 测试 Trimma 场景
-python rule_based_agent.py --scenario trimma
+python rule_based_agent_0203.py --scenario trimma
 
 # 测试施工变道场景
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario construction
 
 # 测试原有锥桶场景
-python rule_based_agent.py --scenario cones
+python rule_based_agent_0203.py --scenario cones
 ```
 
 ---
@@ -156,7 +156,7 @@ python rule_based_agent.py --scenario cones
 ### 示例1: 测试单个场景
 ```bash
 cd /home/ajifang/RL_selector/agents/rule_based
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 # 按 Ctrl+C 停止
 ```
 
@@ -343,9 +343,9 @@ python verify_scenarios.py
 ./run_all.sh
 
 # 测试场景
-python rule_based_agent.py --scenario jaywalker
-python rule_based_agent.py --scenario trimma
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario trimma
+python rule_based_agent_0203.py --scenario construction
 
 # 批量测试
 python batch_test_scenarios.py --duration 60

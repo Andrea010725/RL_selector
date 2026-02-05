@@ -28,7 +28,7 @@ python verify_scenarios.py
 
 **测试命令**:
 ```bash
-python rule_based_agent.py --scenario cones
+python rule_based_agent_0203.py --scenario cones
 ```
 
 **预期行为**:
@@ -58,7 +58,7 @@ ls -lh  # 应该有 telemetry.csv, speed.png, controls.png, ey_vs_s.png
 
 **测试命令**:
 ```bash
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 ```
 
 **预期行为**:
@@ -94,7 +94,7 @@ ls -lh
 
 **测试命令**:
 ```bash
-python rule_based_agent.py --scenario trimma
+python rule_based_agent_0203.py --scenario trimma
 ```
 
 **预期行为**:
@@ -130,7 +130,7 @@ ls -lh
 
 **测试命令**:
 ```bash
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario construction
 ```
 
 **预期行为**:

@@ -48,7 +48,7 @@ def run_scenario(scenario_name, duration=60):
     # 构建命令
     cmd = [
         "timeout", str(duration),
-        "python", "rule_based_agent.py",
+        "python", "rule_based_agent_0203.py",
         "--scenario", scenario_name
     ]
 

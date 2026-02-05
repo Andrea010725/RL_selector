@@ -18,16 +18,16 @@ cd /home/ajifang/RL_selector/agents/rule_based
 #### 方法A: 单独测试每个场景
 ```bash
 # 测试鬼探头场景（行人突然横穿）
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 
 # 测试 Trimma 场景（左右夹击 + 前车）
-python rule_based_agent.py --scenario trimma
+python rule_based_agent_0203.py --scenario trimma
 
 # 测试施工变道场景
-python rule_based_agent.py --scenario construction
+python rule_based_agent_0203.py --scenario construction
 
 # 测试原有锥桶场景（对比基准）
-python rule_based_agent.py --scenario cones
+python rule_based_agent_0203.py --scenario cones
 ```
 
 #### 方法B: 使用自动化测试脚本
@@ -147,7 +147,7 @@ agents/rule_based/
 ./test_scenarios.sh
 
 # 或单独测试
-python rule_based_agent.py --scenario jaywalker
+python rule_based_agent_0203.py --scenario jaywalker
 ```
 
 **按 Ctrl+C 停止当前测试**

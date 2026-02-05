@@ -236,17 +236,33 @@ class ConesScenario(ScenarioBase):
                 # 收集锥桶位置作为避让区域
                 cone_locs = [c.get_location() for c in cones if c is not None]
 
-                # 生成交通流
+                # ✅ 根据车道情况自适应交通流策略
+                # 逻辑：如果两侧都没有可行驶车道，禁止 same_lane 会导致几乎无车流
+                left_wp = start_wp.get_left_lane()
+                right_wp = start_wp.get_right_lane()
+                has_left = bool(left_wp and left_wp.lane_type == carla.LaneType.Driving)
+                has_right = bool(right_wp and right_wp.lane_type == carla.LaneType.Driving)
+
+                print(f"[Cones] 车道邻接情况: left={has_left} right={has_right}")
+
+                # 默认：优先不在当前车道生成（避免锥桶区域拥堵）
+                enable_same_lane = False
+                # 如果两侧都没车道，则允许在本车道生成（通过避让范围控制不干扰锥桶）
+                if (not has_left) and (not has_right):
+                    enable_same_lane = True
+                    print("[Cones] ⚠️ 两侧无可行驶车道，允许在当前车道生成交通流")
+
+                # 生成交通流（第一次尝试）
                 traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
                     base_wp=start_wp,
                     lanes_num=1,
                     opposite_lanes_num=2,
-                    enable_same_lane=False,  # 不在当前车道生成（有锥桶）
-                    enable_left=True,
-                    enable_right=True,
+                    enable_same_lane=enable_same_lane,
+                    enable_left=has_left,
+                    enable_right=has_right,
                     enable_opposite=True,
-                    density_per_100m=8.0,
-                    range_ahead=100.0,
+                    density_per_100m=6.0,
+                    range_ahead=90.0,
                     range_behind=80.0,
                     speed_diff_pct=20.0,
                     disable_lane_change=True,
@@ -255,8 +271,32 @@ class ConesScenario(ScenarioBase):
                     min_gap_to_ego=3.0,
                     avoid_centers=cone_locs,
                     avoid_radius=8.0,
-                    total_spawn_cap=60,
+                    total_spawn_cap=45,
                 )
+
+                # ✅ 如果第一次生成结果过少，再放开同车道约束重试一次
+                if traffic_vehicles is None or len(traffic_vehicles) == 0:
+                    print("[Cones] ⚠️ 首次交通流过少，尝试放开同车道生成并重试")
+                    traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
+                        base_wp=start_wp,
+                        lanes_num=1,
+                        opposite_lanes_num=2,
+                        enable_same_lane=True,
+                        enable_left=has_left,
+                        enable_right=has_right,
+                        enable_opposite=True,
+                        density_per_100m=7.0,
+                        range_ahead=110.0,
+                        range_behind=90.0,
+                        speed_diff_pct=20.0,
+                        disable_lane_change=True,
+                        follow_dist=3.0,
+                        ego_loc=self.ego_spawn_transform.location,
+                        min_gap_to_ego=3.0,
+                        avoid_centers=cone_locs,
+                        avoid_radius=8.0,
+                        total_spawn_cap=55,
+                    )
 
                 self.scenario_actors.extend(traffic_vehicles)
                 print(f"[Cones] ✅ 交通流生成完成，车辆数量: {len(traffic_vehicles)}")
@@ -981,7 +1021,7 @@ class TrimmaScenario(ScenarioBase):
         self.tm_global_distance = float(getattr(config, "tm_global_distance", 2.5))
 
         # ✅ 速度差：前车比左右车快一点点，左右车很慢
-        self.front_speed_diff_pct = float(getattr(config, "front_speed_diff_pct", +70.0))  # 前车：慢70%
+        self.front_speed_diff_pct = float(getattr(config, "front_speed_diff_pct", +85.0))  # 前车：更慢一点
         self.side_speed_diff_pct = float(getattr(config, "side_speed_diff_pct", +80.0))   # 左右车：慢80%
 
         self.disable_lane_change = bool(getattr(config, "disable_lane_change", True))
@@ -1256,23 +1296,26 @@ class TrimmaScenario(ScenarioBase):
         self.scenario_actors.append(left_vehicle)
 
         # 6) 生成右车（右车道，略微前方/并排）
-        right_base_wp = self._move_along_lane(right_wp, self.side_vehicle_offset)
-        if not right_base_wp:
-            print("[Trimma] ❌ 找不到右车 waypoint")
-            return False
-
-        right_vehicle = self._spawn_vehicle_at_waypoint(right_base_wp)
-        if not right_vehicle:
-            print("[Trimma] ❌ 右车生成失败")
-            return False
-
-        self.right_vehicle = right_vehicle
-        self.scenario_actors.append(right_vehicle)
+        # ✅ 按需求：暂不生成右车（保留代码以便以后恢复）
+        # right_base_wp = self._move_along_lane(right_wp, self.side_vehicle_offset)
+        # if not right_base_wp:
+        #     print("[Trimma] ❌ 找不到右车 waypoint")
+        #     return False
+        #
+        # right_vehicle = self._spawn_vehicle_at_waypoint(right_base_wp)
+        # if not right_vehicle:
+        #     print("[Trimma] ❌ 右车生成失败")
+        #     return False
+        #
+        # self.right_vehicle = right_vehicle
+        # self.scenario_actors.append(right_vehicle)
+        right_vehicle = None
+        self.right_vehicle = None
 
         # 7) 设置 TM 行为与速度：前车快，左右慢
         self._apply_tm_settings(front_vehicle, self.front_speed_diff_pct)
         self._apply_tm_settings(left_vehicle, self.side_speed_diff_pct)
-        self._apply_tm_settings(right_vehicle, self.side_speed_diff_pct)
+        # self._apply_tm_settings(right_vehicle, self.side_speed_diff_pct)  # 右车未生成
 
         # 同步模式下 tick 稳定一下
         if self.world.get_settings().synchronous_mode:
@@ -1291,11 +1334,10 @@ class TrimmaScenario(ScenarioBase):
                 client.set_timeout(5.0)
                 self.traffic_flow_spawner = TrafficFlowSpawner(client, self.world, self.tm_port)
 
-                # 避让三辆关键车的位置
+                # 避让关键车的位置（右车暂不生成）
                 avoid_locs = [
                     front_vehicle.get_location(),
                     left_vehicle.get_location(),
-                    right_vehicle.get_location(),
                 ]
 
                 traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
@@ -1329,15 +1371,15 @@ class TrimmaScenario(ScenarioBase):
 
         # 8) 打印信息
         ego_loc = self.ego_spawn_transform.location
-        f_loc = front_vehicle.get_location()
+        # f_loc = front_vehicle.get_location()
         l_loc = left_vehicle.get_location()
-        r_loc = right_vehicle.get_location()
+        # r_loc = right_vehicle.get_location()
 
         print("[Trimma] ✅ 场景生成成功")
         print(f"  - Ego  : ({ego_loc.x:.1f}, {ego_loc.y:.1f})")
-        print(f"  - Front: ({f_loc.x:.1f}, {f_loc.y:.1f}) speed_diff={self.front_speed_diff_pct}%")
+        # print(f"  - Front: ({f_loc.x:.1f}, {f_loc.y:.1f}) speed_diff={self.front_speed_diff_pct}%")
         print(f"  - Left : ({l_loc.x:.1f}, {l_loc.y:.1f}) speed_diff={self.side_speed_diff_pct}%")
-        print(f"  - Right: ({r_loc.x:.1f}, {r_loc.y:.1f}) speed_diff={self.side_speed_diff_pct}%")
+        # print(f"  - Right: ({r_loc.x:.1f}, {r_loc.y:.1f}) speed_diff={self.side_speed_diff_pct}%")
 
         return True
 

@@ -98,7 +98,7 @@ case $choice in
         echo ""
         sleep 2
 
-        python rule_based_agent.py --scenario "$scenario"
+        python rule_based_agent_0203.py --scenario "$scenario"
         ;;
 
     2)
