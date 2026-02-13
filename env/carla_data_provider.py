@@ -242,7 +242,7 @@ class CarlaDataProvider(object):  # pylint: disable=too-many-public-methods
 		CarlaDataProvider._sync_flag = world.get_settings().synchronous_mode
 		CarlaDataProvider._map = world.get_map()
 		CarlaDataProvider._blueprint_library = world.get_blueprint_library()
-		CarlaDataProvider._grp = GlobalRoutePlanner(CarlaDataProvider._map, 2.0)
+		# CarlaDataProvider._grp = GlobalRoutePlanner(CarlaDataProvider._map, 2.0)
 		CarlaDataProvider.generate_spawn_points()
 		CarlaDataProvider.prepare_map()
 

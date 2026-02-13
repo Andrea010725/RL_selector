@@ -169,7 +169,7 @@ class ConesScenario(ScenarioBase):
         self.scenario_description = "锥桶避让场景"
 
         # 读取配置参数
-        self.cone_num = int(getattr(config, "cone_num", 8))
+        self.cone_num = int(getattr(config, "cone_num", 5))
         self.cone_step_behind = float(getattr(config, "cone_step_behind", 3.0))
         self.cone_step_lateral = float(getattr(config, "cone_step_lateral", 0.4))
         self.cone_z_offset = float(getattr(config, "cone_z_offset", 0.5))
@@ -236,67 +236,27 @@ class ConesScenario(ScenarioBase):
                 # 收集锥桶位置作为避让区域
                 cone_locs = [c.get_location() for c in cones if c is not None]
 
-                # ✅ 根据车道情况自适应交通流策略
-                # 逻辑：如果两侧都没有可行驶车道，禁止 same_lane 会导致几乎无车流
-                left_wp = start_wp.get_left_lane()
-                right_wp = start_wp.get_right_lane()
-                has_left = bool(left_wp and left_wp.lane_type == carla.LaneType.Driving)
-                has_right = bool(right_wp and right_wp.lane_type == carla.LaneType.Driving)
-
-                print(f"[Cones] 车道邻接情况: left={has_left} right={has_right}")
-
-                # 默认：优先不在当前车道生成（避免锥桶区域拥堵）
-                enable_same_lane = False
-                # 如果两侧都没车道，则允许在本车道生成（通过避让范围控制不干扰锥桶）
-                if (not has_left) and (not has_right):
-                    enable_same_lane = True
-                    print("[Cones] ⚠️ 两侧无可行驶车道，允许在当前车道生成交通流")
-
-                # 生成交通流（第一次尝试）
+                # 生成交通流
                 traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
                     base_wp=start_wp,
                     lanes_num=1,
                     opposite_lanes_num=2,
-                    enable_same_lane=enable_same_lane,
-                    enable_left=has_left,
-                    enable_right=has_right,
+                    enable_same_lane=False,  # 不在当前车道生成（有锥桶）
+                    enable_left=True,
+                    enable_right=True,
                     enable_opposite=True,
-                    density_per_100m=6.0,
-                    range_ahead=90.0,
+                    density_per_100m=8.0,
+                    range_ahead=100.0,
                     range_behind=80.0,
                     speed_diff_pct=20.0,
                     disable_lane_change=True,
                     follow_dist=3.0,
                     ego_loc=self.ego_spawn_transform.location,
-                    min_gap_to_ego=3.0,
+                    min_gap_to_ego=20.0,
                     avoid_centers=cone_locs,
-                    avoid_radius=8.0,
-                    total_spawn_cap=45,
+                    avoid_radius=15.0,
+                    total_spawn_cap=60,
                 )
-
-                # ✅ 如果第一次生成结果过少，再放开同车道约束重试一次
-                if traffic_vehicles is None or len(traffic_vehicles) == 0:
-                    print("[Cones] ⚠️ 首次交通流过少，尝试放开同车道生成并重试")
-                    traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
-                        base_wp=start_wp,
-                        lanes_num=1,
-                        opposite_lanes_num=2,
-                        enable_same_lane=True,
-                        enable_left=has_left,
-                        enable_right=has_right,
-                        enable_opposite=True,
-                        density_per_100m=7.0,
-                        range_ahead=110.0,
-                        range_behind=90.0,
-                        speed_diff_pct=20.0,
-                        disable_lane_change=True,
-                        follow_dist=3.0,
-                        ego_loc=self.ego_spawn_transform.location,
-                        min_gap_to_ego=3.0,
-                        avoid_centers=cone_locs,
-                        avoid_radius=8.0,
-                        total_spawn_cap=55,
-                    )
 
                 self.scenario_actors.extend(traffic_vehicles)
                 print(f"[Cones] ✅ 交通流生成完成，车辆数量: {len(traffic_vehicles)}")
@@ -565,11 +525,11 @@ class JaywalkerScenario(ScenarioBase):
         self.scenario_description = "鬼探头场景（行人突然横穿）"
 
         self.jaywalker_distance = float(getattr(config, "jaywalker_distance", 20.0))
-        self.jaywalker_speed = float(getattr(config, "jaywalker_speed", 2.0))
+        self.jaywalker_speed = float(getattr(config, "jaywalker_speed", 1.0))
         self.jaywalker_trigger_distance = float(getattr(config, "jaywalker_trigger_distance", 15.0))
         self.jaywalker_start_side = str(getattr(config, "jaywalker_start_side", "random"))
         self.use_occlusion_vehicle = bool(getattr(config, "use_occlusion_vehicle", False))
-        self.occlusion_vehicle_distance = float(getattr(config, "occlusion_vehicle_distance", 18.0))
+        self.occlusion_vehicle_distance = float(getattr(config, "occlusion_vehicle_distance", 15.0))
 
         # ✅ 交通流参数
         self.tm_port = int(getattr(config, "tm_port", 8000))
@@ -869,9 +829,9 @@ class JaywalkerScenario(ScenarioBase):
                     disable_lane_change=True,
                     follow_dist=3.0,
                     ego_loc=self.ego_spawn_transform.location,
-                    min_gap_to_ego=3.0,
+                    min_gap_to_ego=20.0,
                     avoid_centers=avoid_locs,
-                    avoid_radius=8.0,
+                    avoid_radius=15.0,
                     total_spawn_cap=60,
                 )
 
@@ -1334,10 +1294,11 @@ class TrimmaScenario(ScenarioBase):
                 client.set_timeout(5.0)
                 self.traffic_flow_spawner = TrafficFlowSpawner(client, self.world, self.tm_port)
 
-                # 避让关键车的位置（右车暂不生成）
+                # 避让三辆关键车的位置
                 avoid_locs = [
                     front_vehicle.get_location(),
                     left_vehicle.get_location(),
+                    right_vehicle.get_location(),
                 ]
 
                 traffic_vehicles = self.traffic_flow_spawner.spawn_high_density_surrounding_flow(
@@ -1355,9 +1316,9 @@ class TrimmaScenario(ScenarioBase):
                     disable_lane_change=True,
                     follow_dist=3.0,
                     ego_loc=self.ego_spawn_transform.location,
-                    min_gap_to_ego=3.0,
+                    min_gap_to_ego=20.0,
                     avoid_centers=avoid_locs,
-                    avoid_radius=8.0,
+                    avoid_radius=20.0,
                     total_spawn_cap=60,
                 )
 
@@ -1614,6 +1575,11 @@ class ConstructionLaneChangeScenario(ScenarioBase):
                 self.traffic_manager.set_synchronous_mode(self.world.get_settings().synchronous_mode)
             except:
                 pass
+
+            # ✅ 初始化 CarlaDataProvider（ahead_obstacle_scenario 依赖它）
+            CarlaDataProvider.set_world(self.world)
+            CarlaDataProvider.set_client(client)
+            print("[ConstructionLaneChange] ✅ CarlaDataProvider 初始化成功")
         except Exception as e:
             print(f"[ConstructionLaneChange] ⚠️ 获取TrafficManager失败: {e}")
             self.traffic_manager = None
@@ -1732,9 +1698,9 @@ class ConstructionLaneChangeScenario(ScenarioBase):
                         disable_lane_change=True,
                         follow_dist=4.0,
                         ego_loc=self.ego_spawn_transform.location,
-                        min_gap_to_ego=3.0,
+                        min_gap_to_ego=20.0,
                         avoid_centers=avoid_locs,
-                        avoid_radius=8.0,
+                        avoid_radius=25.0,
                         total_spawn_cap=80,
                     )
 

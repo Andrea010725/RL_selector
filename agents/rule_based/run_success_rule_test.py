@@ -34,7 +34,7 @@ from env.scenarios import (
 
 # 引入你的 rule-based agent
 sys.path.append("/home/ajifang/RL_selector/agents/rule_based")
-from easy import RuleBasedPlanner
+from rule_based_agent import RuleBasedPlanner
 
 # ================================
 # 复制版：carla_utils（不依赖 il_data_collector）
@@ -554,7 +554,7 @@ def run_one_episode(client: carla.Client, scenario_name: str, tm_port: int) -> D
         scenario.cleanup()
         return {"collision": True, "r_saf": None, "r_com": None, "r_eff": None}
 
-    # ✅ 预热几帧，避免刚生成交通流就卡在 tick
+    # 预热
     try:
         for _ in range(3):
             world.tick()
@@ -567,15 +567,11 @@ def run_one_episode(client: carla.Client, scenario_name: str, tm_port: int) -> D
     except Exception:
         pass
 
-    # rule-based planner
+    # rule-based planner (注意：新版 Agent 的参数和逻辑)
     planner = RuleBasedPlanner(amap)
-    if scenario_name == "cones":
-        planner.enable_auto_lane_change = False
-    elif scenario_name == "trimma":
-        planner.enable_overtake = True
-    elif scenario_name == "construction":
-        planner.include_all_props_as_cones = True
-
+    # 注意：新版 Agent 内部可能没有这些属性了，如果报错请注释掉
+    # planner.enable_auto_lane_change = False 
+    
     # eva
     eva = EvaMonitor()
     eva.attach(world, ego)
@@ -596,10 +592,21 @@ def run_one_episode(client: carla.Client, scenario_name: str, tm_port: int) -> D
             scenario.check_and_trigger(ego.get_location())
             scenario.tick_update()
 
-        # 更新规划与控制
-        planner.update_corridor(world, ego, s_ahead=35.0, ds=1.0, debug_draw=False)
-        throttle, steer, brake, _ = planner.compute_control(ego)
-        ego.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
+        # --- 修改部分：适配新版 RuleBasedPlanner ---
+        try:
+            # 在新版 Agent 中，update_corridor 已经包含了规划和控制逻辑并返回 tuple
+            # 返回值格式: (throttle, steer, brake, debug_info)
+            ctrl_result = planner.update_corridor(world, ego)
+            
+            if ctrl_result and len(ctrl_result) >= 3:
+                throttle, steer, brake = ctrl_result[0], ctrl_result[1], ctrl_result[2]
+                ego.apply_control(carla.VehicleControl(throttle=float(throttle), 
+                                                       steer=float(steer), 
+                                                       brake=float(brake)))
+        except Exception as e:
+            print(f"Planner Error: {e}")
+            break 
+        # ------------------------------------------
 
         data = eva.tick()
         eva.render(data)
@@ -614,7 +621,7 @@ def run_one_episode(client: carla.Client, scenario_name: str, tm_port: int) -> D
 
     # 清理
     collision.destroy()
-    if ego.is_alive:
+    if ego and ego.is_alive:
         ego.destroy()
     scenario.cleanup()
 
